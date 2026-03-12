@@ -1,0 +1,51 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "dns": {
+    "strategy": "prefer_ipv4"
+  },
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    },
+    {
+      "type": "hysteria2",
+      "tag": "proxy",
+      "server": "CHANGE_ME_SERVER",
+      "server_port": 443,
+      "password": "CHANGE_ME_LAB_PASSWORD"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "rules": [
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "cn"
+        ],
+        "outbound": "direct"
+      },
+      {
+        "domain_keyword": [
+          "google",
+          "youtube",
+          "openai",
+          "anthropic",
+          "github"
+        ],
+        "outbound": "proxy"
+      }
+    ],
+    "final": "direct"
+  }
+}
