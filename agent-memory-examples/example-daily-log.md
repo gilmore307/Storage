@@ -1,0 +1,13 @@
+- User preference: for cloud/server operations, the assistant should execute all server-side commands directly instead of asking the user to run them.
+- User preference: for the network-framework project, proceed autonomously step by step, continue without waiting for replies, and post progress updates after each completed part.
+- User preference: for the network-framework project, upload progress updates to GitHub as work advances.
+- Efficiency rule: once framework and outline are agreed, autonomous execution mode can start. After each completed item, report progress and immediately continue to the next item without waiting for a reply. If the outline still has undecided parts, surface them before autonomous mode starts and discuss them first.
+- Session continuity rule: archive full conversation records and file modification actions.
+- Session continuity rule: maintain an incrementally updated session work list containing completed work, todos, current blockers, and status.
+- Session handoff rule: a new session should read the previous session's work checklist/handoff rather than the full archived conversation by default.
+- User timezone/work timezone should be treated as Asia/Shanghai (北京时间), not UTC.
+- Durable work rule: autonomous work principles and session maintenance principles were promoted into SOUL.md, including: report after each completed item, sync to GitHub after each completed item when repo is available, if no item completes then still report at least every 10 minutes, and progress reports should be incremental (only the latest work window).
+- Efficiency finding: for the `network-framework` project, short-interval supervised execution produced much higher output than loose autonomous execution; in practice, cadence + visible deliverables matter more than open-ended autonomy.
+- User decided not to adopt Syncthing as the current transfer path because requiring a foreground PowerShell window on Windows is not acceptable for daily use; file handoff should use the GitHub storage repo (`https://github.com/gilmore307/Storage`) and commits there instead.
+- `network-framework` repo now contains initial Syncthing scaffold (server/node scripts, rollout docs, operator checklist) and initial sing-box scaffold (server install/config/service/bootstrap docs + first client template/rollout docs), with changes being committed and pushed incrementally.
+- Memory directory was re-normalized with `memory/INDEX.md`: daily files are the primary timeline, topic-specific files are supporting detail, and session/current-state capture files are secondary recovery aids rather than the main long-term source of truth.
