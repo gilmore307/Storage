@@ -116,7 +116,7 @@ class NodeTrayApp:
             return False
         name = self._safe_name(proc)
         cmdline = self._safe_cmdline(proc).lower()
-        expected_forward = f"{self.node_cfg['local_port']}:127.0.0.1:{self.node_cfg['remote_port']}".lower()
+        expected_forward = f"{self.node_cfg['gateway_tunnel_local_port']}:127.0.0.1:{self.node_cfg['remote_port']}".lower()
         expected_host = f"{tunnel['ssh_user']}@{tunnel['ssh_host']}".lower()
         return name == "ssh.exe" and expected_forward in cmdline and expected_host in cmdline
 
@@ -247,7 +247,7 @@ class NodeTrayApp:
                 "-o", "ExitOnForwardFailure=yes",
                 "-o", "ServerAliveInterval=30",
                 "-o", "ServerAliveCountMax=3",
-                "-L", f"{self.node_cfg['local_port']}:127.0.0.1:{self.node_cfg['remote_port']}",
+                "-L", f"{self.node_cfg['gateway_tunnel_local_port']}:127.0.0.1:{self.node_cfg['remote_port']}",
                 f"{tunnel['ssh_user']}@{tunnel['ssh_host']}",
             ],
             stdin=subprocess.DEVNULL,
@@ -271,7 +271,7 @@ class NodeTrayApp:
                 "node",
                 "run",
                 "--host", self.node_cfg.get("bind_host", "127.0.0.1"),
-                "--port", str(self.node_cfg["local_port"]),
+                "--port", str(self.node_cfg["node_port"]),
                 "--display-name", self.node_cfg["display_name"],
             ],
             stdin=subprocess.DEVNULL,
