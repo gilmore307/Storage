@@ -3,6 +3,23 @@
     "level": "info"
   },
   "dns": {
+    "servers": [
+      {
+        "tag": "remote",
+        "type": "tls",
+        "server": "8.8.8.8",
+        "server_port": 853,
+        "detour": "proxy"
+      },
+      {
+        "tag": "local",
+        "type": "udp",
+        "server": "223.5.5.5",
+        "server_port": 53,
+        "detour": "direct"
+      }
+    ],
+    "final": "remote",
     "strategy": "prefer_ipv4"
   },
   "inbounds": [
@@ -43,7 +60,15 @@
   ],
   "route": {
     "auto_detect_interface": true,
+    "default_domain_resolver": "remote",
     "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
       {
         "ip_is_private": true,
         "outbound": "direct"
