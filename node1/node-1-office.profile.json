@@ -15,7 +15,6 @@
     "nodejs_path": "C:/Program Files/nodejs/node.exe",
     "openclaw_path": "C:/Users/sunch/AppData/Roaming/npm/node_modules/openclaw/dist/index.js",
     "bind_host": "127.0.0.1",
-    "local_port": 18789,
     "remote_port": 18789,
     "prefer_direct": true,
     "direct_gateway_host": "100.110.207.125",
@@ -27,7 +26,9 @@
       "ssh_exe": "ssh",
       "ssh_user": "root",
       "ssh_host": "100.110.207.125"
-    }
+    },
+    "node_port": 18790,
+    "gateway_tunnel_local_port": 18789
   },
   "vpn": {
     "singbox_exe": "resources/sing-box.exe",

@@ -107,7 +107,7 @@ class NodeTrayApp:
             name == Path(self.resolve_path(self.node_cfg["nodejs_path"])).name.lower()
             and self.resolve_path(self.node_cfg["openclaw_path"]).lower() in cmdline
             and self._contains_flag_with_value(cmdline, "--display-name", self.node_cfg["display_name"].lower())
-            and self._contains_flag_with_value(cmdline, "--port", str(self.node_cfg["local_port"]))
+            and self._contains_flag_with_value(cmdline, "--port", str(self.node_cfg["node_port"]))
         )
 
     def is_ssh_process(self, proc) -> bool:
@@ -488,4 +488,6 @@ def main():
 
 
 if __name__ == "__main__":
+    main()
+__":
     main()
