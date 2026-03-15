@@ -1,0 +1,54 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "dns": {
+    "strategy": "prefer_ipv4"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "sb-tun",
+      "address": [
+        "172.19.0.1/30"
+      ],
+      "mtu": 1500,
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "system"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    },
+    {
+      "type": "hysteria2",
+      "tag": "proxy",
+      "server": "202.182.113.50",
+      "server_port": 8443,
+      "password": "Zz9zIk7b6j1cWkg18S9y4R8r",
+      "tls": {
+        "enabled": true,
+        "server_name": "202.182.113.50",
+        "certificate_path": "C:\\sing-box\\config\\server.crt"
+      }
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "rules": [
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      }
+    ],
+    "final": "proxy"
+  }
+}
