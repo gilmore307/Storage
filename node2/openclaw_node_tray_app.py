@@ -271,7 +271,7 @@ class NodeTrayApp:
                 "node",
                 "run",
                 "--host", self.node_cfg.get("bind_host", "127.0.0.1"),
-                "--port", str(self.node_cfg["node_port"]),
+                "--port", str(self.node_cfg["gateway_tunnel_local_port"]),
                 "--display-name", self.node_cfg["display_name"],
             ],
             stdin=subprocess.DEVNULL,
