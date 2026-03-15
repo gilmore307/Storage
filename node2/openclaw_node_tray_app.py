@@ -455,12 +455,27 @@ class NodeTrayApp:
 
 def main():
     import argparse
+    import sys
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--profile", required=True, help="Path to profile json")
+    parser.add_argument("--profile", help="Path to profile json")
     args = parser.parse_args()
 
-    profile = load_profile(args.profile)
+    profile_path = args.profile
+    if not profile_path:
+        exe_path = Path(sys.executable if getattr(sys, 'frozen', False) else __file__).resolve()
+        candidate = exe_path.with_suffix('.profile.json')
+        if candidate.exists():
+            profile_path = str(candidate)
+        else:
+            script_candidate = Path(__file__).resolve().with_name(exe_path.stem + '.profile.json')
+            if script_candidate.exists():
+                profile_path = str(script_candidate)
+
+    if not profile_path:
+        raise SystemExit('Profile not found. Pass --profile or place <exe-name>.profile.json beside the executable.')
+
+    profile = load_profile(profile_path)
     app = NodeTrayApp(profile)
     app.run()
 
