@@ -9,6 +9,7 @@ pyinstaller `
  --noconsole `
  --onefile `
  --clean `
+ --uac-admin `
  --name $ProfileName `
  --distpath (Join-Path $Root 'dist') `
  --workpath (Join-Path $Root 'build-work') `
