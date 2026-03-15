@@ -294,13 +294,14 @@ class NodeTrayApp:
 
     def start_vpn(self):
         self.kill_processes(self.find_processes(self.is_vpn_process), "vpn")
-        self.write_log("Starting sing-box VPN...")
+        runtime_config = self.generate_vpn_runtime_config()
+        self.write_log(f"Starting sing-box VPN with config: {runtime_config}")
         subprocess.Popen(
             [
                 self.resolve_path(self.vpn_cfg["singbox_exe"]),
                 "run",
                 "-c",
-                self.resolve_path(self.vpn_cfg["config_path"]),
+                runtime_config,
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
