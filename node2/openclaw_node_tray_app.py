@@ -175,7 +175,7 @@ class NodeTrayApp:
                 if isinstance(tls_cfg, dict) and tls_cfg.get("certificate_path"):
                     tls_cfg["certificate_path"] = resolved_cert_path
 
-        out_path = Path(self.generated_vpn_config_path)
+        out_path = Path(getattr(self, "generated_vpn_config_path", self.resolve_path(self.vpn_cfg.get("generated_config_path", "generated/vpn.generated.json"))))
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
