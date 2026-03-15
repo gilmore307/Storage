@@ -325,7 +325,7 @@ class NodeTrayApp:
             return False
         gateway_url = self.choose_gateway_url()
         if gateway_url == self.node_cfg.get("tunnel_gateway_url"):
-            return len(self.find_processes(self.is_ssh_process)) > 0 and self.is_local_port_open("127.0.0.1", int(self.node_cfg["local_port"]), self.socket_timeout)
+            return len(self.find_processes(self.is_ssh_process)) > 0 and self.is_local_port_open("127.0.0.1", int(self.node_cfg["gateway_tunnel_local_port"]), self.socket_timeout)
         return True
 
     def check_vpn_status(self) -> bool:
