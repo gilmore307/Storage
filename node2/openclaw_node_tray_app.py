@@ -256,7 +256,13 @@ class NodeTrayApp:
             shell=False,
             creationflags=PROCESS_FLAGS,
         )
-        time.sleep(self.startup_wait)
+        deadline = time.time() + max(self.startup_wait, 8)
+        while time.time() < deadline:
+            if self.is_local_port_open("127.0.0.1", int(self.node_cfg["gateway_tunnel_local_port"]), self.socket_timeout):
+                self.write_log("SSH tunnel local port is ready.")
+                return
+            time.sleep(0.5)
+        self.write_log("SSH tunnel local port did not become ready before timeout.")
 
     def start_node(self):
         gateway_url = self.choose_gateway_url()
