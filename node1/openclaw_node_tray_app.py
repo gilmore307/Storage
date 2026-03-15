@@ -50,6 +50,7 @@ class NodeTrayApp:
         self.check_interval = self.app_cfg.get("check_interval", 10)
         self.startup_wait = self.app_cfg.get("startup_wait", 2)
         self.socket_timeout = self.app_cfg.get("socket_timeout", 1.5)
+        self.generated_vpn_config_path = self.resolve_path(self.vpn_cfg.get("generated_config_path", "generated/vpn.generated.json"))
 
         self.env = os.environ.copy()
         self.env["OPENCLAW_GATEWAY_TOKEN"] = self.node_cfg["gateway_token"]
