@@ -294,13 +294,14 @@ class NodeTrayApp:
 
     def start_vpn(self):
         self.kill_processes(self.find_processes(self.is_vpn_process), "vpn")
-        self.write_log("Starting sing-box VPN...")
+        runtime_config = self.generate_vpn_runtime_config()
+        self.write_log(f"Starting sing-box VPN with config: {runtime_config}")
         subprocess.Popen(
             [
                 self.resolve_path(self.vpn_cfg["singbox_exe"]),
                 "run",
                 "-c",
-                self.resolve_path(self.vpn_cfg["config_path"]),
+                runtime_config,
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -393,15 +394,20 @@ class NodeTrayApp:
                 icon.notify("VPN stopped", self.profile['profile_name'])
 
     def restart_all(self, icon=None, menu_item=None):
-        with self.state_lock:
-            self.stop_vpn()
-            self.stop_node()
-            if self.node_desired:
-                self.start_node()
-            if self.vpn_desired:
-                self.start_vpn()
+        try:
+            with self.state_lock:
+                self.stop_vpn()
+                self.stop_node()
+                if self.node_desired:
+                    self.start_node()
+                if self.vpn_desired:
+                    self.start_vpn()
+                if icon:
+                    icon.notify("Restarted configured services", self.profile['profile_name'])
+        except Exception as e:
+            self.write_exception("restart_all error", e)
             if icon:
-                icon.notify("Restarted configured services", self.profile['profile_name'])
+                icon.notify(f"Restart failed: {e}", self.profile['profile_name'])
 
     def on_exit(self, icon=None, menu_item=None):
         self.write_log("Exit requested.")

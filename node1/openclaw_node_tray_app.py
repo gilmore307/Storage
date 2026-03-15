@@ -393,15 +393,20 @@ class NodeTrayApp:
                 icon.notify("VPN stopped", self.profile['profile_name'])
 
     def restart_all(self, icon=None, menu_item=None):
-        with self.state_lock:
-            self.stop_vpn()
-            self.stop_node()
-            if self.node_desired:
-                self.start_node()
-            if self.vpn_desired:
-                self.start_vpn()
+        try:
+            with self.state_lock:
+                self.stop_vpn()
+                self.stop_node()
+                if self.node_desired:
+                    self.start_node()
+                if self.vpn_desired:
+                    self.start_vpn()
+                if icon:
+                    icon.notify("Restarted configured services", self.profile['profile_name'])
+        except Exception as e:
+            self.write_exception("restart_all error", e)
             if icon:
-                icon.notify("Restarted configured services", self.profile['profile_name'])
+                icon.notify(f"Restart failed: {e}", self.profile['profile_name'])
 
     def on_exit(self, icon=None, menu_item=None):
         self.write_log("Exit requested.")
