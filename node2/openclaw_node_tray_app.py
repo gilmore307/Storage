@@ -200,6 +200,8 @@ class NodeTrayApp:
         self.state_lock = threading.Lock()
         self.tray_icon = None
         self.monitor_thread = None
+        self.tray_ready = threading.Event()
+        self.shutting_down = False
 
         self.profile = {}
         self.profile_path = None
@@ -834,8 +836,17 @@ class NodeTrayApp:
         return len(self.find_processes(self.is_vpn_process)) > 0
 
     def load_base_icon(self) -> Image.Image:
-        img = Image.open(self.icon_path).convert("RGBA")
-        return img.resize((64, 64))
+        try:
+            img = Image.open(self.icon_path).convert("RGBA")
+            return img.resize((64, 64))
+        except Exception as e:
+            self.write_log(f"load_base_icon fallback: {e}")
+            img = Image.new("RGBA", (64, 64), (22, 26, 34, 255))
+            draw = ImageDraw.Draw(img)
+            draw.rounded_rectangle((4, 4, 60, 60), radius=14, fill=(35, 45, 62, 255), outline=(95, 185, 255, 255), width=3)
+            draw.ellipse((10, 22, 28, 40), fill=(70, 210, 120, 255))
+            draw.ellipse((36, 22, 54, 40), fill=(70, 170, 255, 255))
+            return img
 
     def make_status_icon(self) -> Image.Image:
         base = self.load_base_icon().copy()
@@ -871,7 +882,9 @@ class NodeTrayApp:
                 f"node={'ON' if self.node_status else 'OFF'} | "
                 f"vpn={self.vpn_mode.upper()} ({'UP' if self.vpn_status else 'DOWN'})"
             )
-            self.tray_icon.update_menu()
+            if self.tray_ready.is_set() and not self.shutting_down:
+                self.tray_icon.visible = True
+                self.tray_icon.update_menu()
         except Exception as e:
             self.write_log(f"refresh_ui error: {e}")
 
@@ -960,11 +973,16 @@ class NodeTrayApp:
 
     def on_exit(self, icon=None, menu_item=None):
         self.write_log("Exit requested.")
+        self.shutting_down = True
         self.stop_event.set()
         with self.state_lock:
             self.stop_vpn()
             self.stop_node()
         if icon:
+            try:
+                icon.visible = False
+            except Exception:
+                pass
             icon.stop()
 
     def monitor_loop(self):
@@ -974,13 +992,36 @@ class NodeTrayApp:
                 with self.state_lock:
                     self.node_status = self.check_node_status()
                     self.vpn_status = self.check_vpn_status()
-                    self.refresh_ui()
+                    if not self.shutting_down:
+                        self.refresh_ui()
             except Exception as e:
                 self.write_exception("monitor_loop error", e)
 
             self.stop_event.wait(self.check_interval)
 
         self.write_log("Monitor thread exited.")
+
+    def _tray_setup(self, icon):
+        self.write_log("Tray icon backend ready.")
+        self.tray_ready.set()
+        try:
+            icon.visible = True
+        except Exception as e:
+            self.write_log(f"icon.visible setup error: {e}")
+
+        self.monitor_thread = threading.Thread(target=self.monitor_loop, daemon=True)
+        self.monitor_thread.start()
+
+        with self.state_lock:
+            if self.node_desired:
+                self.start_node()
+
+            if self.vpn_mode != "off":
+                self.start_vpn()
+
+            self.node_status = self.check_node_status()
+            self.vpn_status = self.check_vpn_status()
+            self.refresh_ui()
 
     def run(self):
         self.write_log("Tray app started.")
@@ -1003,21 +1044,7 @@ class NodeTrayApp:
             ),
         )
 
-        self.monitor_thread = threading.Thread(target=self.monitor_loop, daemon=True)
-        self.monitor_thread.start()
-
-        with self.state_lock:
-            if self.node_desired:
-                self.start_node()
-
-            if self.vpn_mode != "off":
-                self.start_vpn()
-
-            self.node_status = self.check_node_status()
-            self.vpn_status = self.check_vpn_status()
-            self.refresh_ui()
-
-        self.tray_icon.run()
+        self.tray_icon.run(setup=self._tray_setup)
 
 
 def main():
