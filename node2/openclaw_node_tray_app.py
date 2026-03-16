@@ -230,6 +230,12 @@ class NodeTrayApp:
         self.vpn_stdout_log_path = ""
         self.vpn_stderr_log_path = ""
         self.env = os.environ.copy()
+        self.vpn_interface_name = "sb-tun"
+        self.vpn_speed_refresh_interval = 1.0
+        self.vpn_rx_rate_bps = 0.0
+        self.vpn_tx_rate_bps = 0.0
+        self._vpn_last_counters = None
+        self._vpn_last_ts = None
 
         self.apply_profile(profile, preserve_runtime_choices=False)
 
@@ -261,6 +267,7 @@ class NodeTrayApp:
         self.check_interval = self.app_cfg.get("check_interval", 10)
         self.startup_wait = self.app_cfg.get("startup_wait", 2)
         self.socket_timeout = self.app_cfg.get("socket_timeout", 1.5)
+        self.vpn_speed_refresh_interval = float(self.app_cfg.get("vpn_speed_refresh_interval", 1.0) or 1.0)
 
         self.generated_vpn_config_path = self.resolve_path(
             self.vpn_cfg.get("generated_config_path", "generated/vpn.generated.json")
@@ -284,6 +291,8 @@ class NodeTrayApp:
             self.app_cfg.get("vpn_stderr_log_path", "generated/vpn.stderr.log")
         )
 
+        self.vpn_interface_name = self.detect_vpn_interface_name()
+
         self.env = os.environ.copy()
         self.env["OPENCLAW_GATEWAY_TOKEN"] = str(self.node_cfg["gateway_token"]).strip()
         self.env.pop("OPENCLAW_GATEWAY_PASSWORD", None)
@@ -301,6 +310,30 @@ class NodeTrayApp:
 
     def reload_profile_from_disk(self, preserve_runtime_choices: bool = True):
         self.apply_profile(load_profile(str(self.profile_path)), preserve_runtime_choices=preserve_runtime_choices)
+
+    def detect_vpn_interface_name(self) -> str:
+        config_candidates = []
+        template_path = self.vpn_cfg.get("config_template_path") or self.vpn_cfg.get("config_path")
+        if template_path:
+            config_candidates.append(self.resolve_path(template_path))
+        generated_path = self.vpn_cfg.get("generated_config_path")
+        if generated_path:
+            config_candidates.append(self.resolve_path(generated_path))
+
+        for path_value in config_candidates:
+            try:
+                path = Path(path_value)
+                if not path.exists():
+                    continue
+                with open(path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                for inbound in config.get("inbounds", []):
+                    if inbound.get("type") == "tun" and inbound.get("interface_name"):
+                        return str(inbound["interface_name"]).strip()
+            except Exception as exc:
+                self.write_log(f"detect_vpn_interface_name skipped {path_value}: {exc}")
+
+        return "sb-tun"
 
     def resolve_path(self, path_value: str) -> str:
         p = Path(path_value)
@@ -687,6 +720,92 @@ if ($null -ne $value -and $value.Length -gt 0) {{
                 self.write_log(f"Windows keyword prompt fallback to tkinter: {exc}")
         return self._prompt_for_keyword_input_tk()
 
+    @staticmethod
+    def _format_rate(rate_bps: float) -> str:
+        units = ["B/s", "KB/s", "MB/s", "GB/s"]
+        value = max(0.0, float(rate_bps or 0.0))
+        unit_index = 0
+        while value >= 1024.0 and unit_index < len(units) - 1:
+            value /= 1024.0
+            unit_index += 1
+        if unit_index == 0:
+            return f"{int(round(value))} {units[unit_index]}"
+        if value >= 100:
+            return f"{value:.0f} {units[unit_index]}"
+        if value >= 10:
+            return f"{value:.1f} {units[unit_index]}"
+        return f"{value:.2f} {units[unit_index]}"
+
+    def vpn_speed_text(self) -> str:
+        if not self.vpn_status or self.vpn_mode == "off":
+            return "↓0 B/s ↑0 B/s"
+        return f"↓{self._format_rate(self.vpn_rx_rate_bps)} ↑{self._format_rate(self.vpn_tx_rate_bps)}"
+
+    def _resolve_vpn_nic_name(self) -> Optional[str]:
+        target = (self.vpn_interface_name or "").strip().lower()
+        if not target:
+            return None
+        try:
+            counters = psutil.net_io_counters(pernic=True)
+        except Exception:
+            return None
+
+        for nic_name in counters:
+            if nic_name.lower() == target:
+                return nic_name
+        for nic_name in counters:
+            if target in nic_name.lower():
+                return nic_name
+        return None
+
+    def update_vpn_speed(self, reset: bool = False):
+        if reset or self.vpn_mode == "off" or not self.vpn_status:
+            self.vpn_rx_rate_bps = 0.0
+            self.vpn_tx_rate_bps = 0.0
+            self._vpn_last_counters = None
+            self._vpn_last_ts = None
+            return
+
+        nic_name = self._resolve_vpn_nic_name()
+        if not nic_name:
+            self.vpn_rx_rate_bps = 0.0
+            self.vpn_tx_rate_bps = 0.0
+            self._vpn_last_counters = None
+            self._vpn_last_ts = None
+            return
+
+        try:
+            counters = psutil.net_io_counters(pernic=True).get(nic_name)
+        except Exception as exc:
+            self.write_log(f"update_vpn_speed error: {exc}")
+            self.vpn_rx_rate_bps = 0.0
+            self.vpn_tx_rate_bps = 0.0
+            self._vpn_last_counters = None
+            self._vpn_last_ts = None
+            return
+
+        if counters is None:
+            self.vpn_rx_rate_bps = 0.0
+            self.vpn_tx_rate_bps = 0.0
+            self._vpn_last_counters = None
+            self._vpn_last_ts = None
+            return
+
+        now = time.time()
+        current = (float(counters.bytes_recv), float(counters.bytes_sent))
+        if self._vpn_last_counters is not None and self._vpn_last_ts is not None:
+            elapsed = max(now - self._vpn_last_ts, 1e-6)
+            recv_delta = max(0.0, current[0] - self._vpn_last_counters[0])
+            sent_delta = max(0.0, current[1] - self._vpn_last_counters[1])
+            self.vpn_rx_rate_bps = recv_delta / elapsed
+            self.vpn_tx_rate_bps = sent_delta / elapsed
+        else:
+            self.vpn_rx_rate_bps = 0.0
+            self.vpn_tx_rate_bps = 0.0
+
+        self._vpn_last_counters = current
+        self._vpn_last_ts = now
+
     def build_vpn_runtime_config(self, mode: Optional[str] = None) -> dict:
 
         mode = self.normalize_vpn_mode(mode or self.vpn_mode, True)
@@ -895,12 +1014,14 @@ if ($null -ne $value -and $value.Length -gt 0) {{
 
         time.sleep(self.startup_wait)
         self.vpn_status = self.check_vpn_status()
+        self.update_vpn_speed(reset=not self.vpn_status)
         self.refresh_ui()
 
     def stop_vpn(self):
         self.write_log("Stopping sing-box VPN...")
         self.kill_processes(self.find_processes(self.is_vpn_process), "vpn")
         self.vpn_status = False
+        self.update_vpn_speed(reset=True)
         self.refresh_ui()
 
     def reload_vpn_locked(self, icon=None, reason: Optional[str] = None):
@@ -976,10 +1097,12 @@ if ($null -ne $value -and $value.Length -gt 0) {{
 
         try:
             self.tray_icon.icon = self.make_status_icon()
+            speed_text = self.vpn_speed_text() if self.vpn_mode != "off" else "↓0 B/s ↑0 B/s"
             self.tray_icon.title = (
                 f"{self.profile['profile_name']} | "
                 f"node={'ON' if self.node_status else 'OFF'} | "
-                f"vpn={self.vpn_mode.upper()} ({'UP' if self.vpn_status else 'DOWN'})"
+                f"vpn={self.vpn_mode.upper()} ({'UP' if self.vpn_status else 'DOWN'}) | "
+                f"{speed_text}"
             )
             if self.tray_ready.is_set() and not self.shutting_down:
                 self.tray_icon.visible = True
@@ -1086,17 +1209,23 @@ if ($null -ne $value -and $value.Length -gt 0) {{
 
     def monitor_loop(self):
         self.write_log("Monitor thread started.")
+        last_status_check = 0.0
+        loop_interval = max(0.5, min(float(self.check_interval), float(self.vpn_speed_refresh_interval)))
         while not self.stop_event.is_set():
             try:
                 with self.state_lock:
-                    self.node_status = self.check_node_status()
-                    self.vpn_status = self.check_vpn_status()
+                    now = time.time()
+                    if now - last_status_check >= float(self.check_interval):
+                        self.node_status = self.check_node_status()
+                        self.vpn_status = self.check_vpn_status()
+                        last_status_check = now
+                    self.update_vpn_speed(reset=not self.vpn_status)
                     if not self.shutting_down:
                         self.refresh_ui()
             except Exception as e:
                 self.write_exception("monitor_loop error", e)
 
-            self.stop_event.wait(self.check_interval)
+            self.stop_event.wait(loop_interval)
 
         self.write_log("Monitor thread exited.")
 
@@ -1136,6 +1265,7 @@ if ($null -ne $value -and $value.Length -gt 0) {{
                 item("VPN ON", self.vpn_on_menu, checked=lambda _: self.vpn_mode == "on", radio=True),
                 item("VPN AUTO", self.vpn_auto_menu, checked=lambda _: self.vpn_mode == "auto", radio=True),
                 item("VPN OFF", self.vpn_off_menu, checked=lambda _: self.vpn_mode == "off", radio=True),
+                item(lambda _: f"VPN Speed {self.vpn_speed_text()}", self.noop, enabled=False),
                 item("Reload", self.reload_vpn_menu),
                 item("Add Keyword", self.add_keyword_menu),
                 pystray.Menu.SEPARATOR,
