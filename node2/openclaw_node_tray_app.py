@@ -234,6 +234,8 @@ class NodeTrayApp:
         self.vpn_speed_refresh_interval = 1.0
         self.vpn_rx_rate_bps = 0.0
         self.vpn_tx_rate_bps = 0.0
+        self.vpn_rx_total_bytes = 0.0
+        self.vpn_tx_total_bytes = 0.0
         self._vpn_last_counters = None
         self._vpn_last_ts = None
 
@@ -736,10 +738,29 @@ if ($null -ne $value -and $value.Length -gt 0) {{
             return f"{value:.1f} {units[unit_index]}"
         return f"{value:.2f} {units[unit_index]}"
 
+    @staticmethod
+    def _format_bytes(byte_count: float) -> str:
+        units = ["B", "KB", "MB", "GB", "TB"]
+        value = max(0.0, float(byte_count or 0.0))
+        unit_index = 0
+        while value >= 1024.0 and unit_index < len(units) - 1:
+            value /= 1024.0
+            unit_index += 1
+        if unit_index == 0:
+            return f"{int(round(value))} {units[unit_index]}"
+        if value >= 100:
+            return f"{value:.0f} {units[unit_index]}"
+        if value >= 10:
+            return f"{value:.1f} {units[unit_index]}"
+        return f"{value:.2f} {units[unit_index]}"
+
     def vpn_speed_text(self) -> str:
         if not self.vpn_status or self.vpn_mode == "off":
             return "↓0 B/s ↑0 B/s"
         return f"↓{self._format_rate(self.vpn_rx_rate_bps)} ↑{self._format_rate(self.vpn_tx_rate_bps)}"
+
+    def vpn_total_text(self) -> str:
+        return f"↓{self._format_bytes(self.vpn_rx_total_bytes)} ↑{self._format_bytes(self.vpn_tx_total_bytes)}"
 
     def _resolve_vpn_nic_name(self) -> Optional[str]:
         target = (self.vpn_interface_name or "").strip().lower()
@@ -799,6 +820,8 @@ if ($null -ne $value -and $value.Length -gt 0) {{
             sent_delta = max(0.0, current[1] - self._vpn_last_counters[1])
             self.vpn_rx_rate_bps = recv_delta / elapsed
             self.vpn_tx_rate_bps = sent_delta / elapsed
+            self.vpn_rx_total_bytes += recv_delta
+            self.vpn_tx_total_bytes += sent_delta
         else:
             self.vpn_rx_rate_bps = 0.0
             self.vpn_tx_rate_bps = 0.0
@@ -1098,11 +1121,12 @@ if ($null -ne $value -and $value.Length -gt 0) {{
         try:
             self.tray_icon.icon = self.make_status_icon()
             speed_text = self.vpn_speed_text() if self.vpn_mode != "off" else "↓0 B/s ↑0 B/s"
+            total_text = self.vpn_total_text()
             self.tray_icon.title = (
                 f"{self.profile['profile_name']} | "
                 f"node={'ON' if self.node_status else 'OFF'} | "
                 f"vpn={self.vpn_mode.upper()} ({'UP' if self.vpn_status else 'DOWN'}) | "
-                f"{speed_text}"
+                f"{speed_text} | Total {total_text}"
             )
             if self.tray_ready.is_set() and not self.shutting_down:
                 self.tray_icon.visible = True
@@ -1262,10 +1286,11 @@ if ($null -ne $value -and $value.Length -gt 0) {{
                 item("Node ON", self.node_on_menu, checked=lambda _: self.node_desired, radio=True),
                 item("Node OFF", self.node_off_menu, checked=lambda _: not self.node_desired, radio=True),
                 pystray.Menu.SEPARATOR,
+                item(lambda _: f"VPN Speed {self.vpn_speed_text()}", self.noop, enabled=False),
+                item(lambda _: f"VPN Total {self.vpn_total_text()}", self.noop, enabled=False),
                 item("VPN ON", self.vpn_on_menu, checked=lambda _: self.vpn_mode == "on", radio=True),
                 item("VPN AUTO", self.vpn_auto_menu, checked=lambda _: self.vpn_mode == "auto", radio=True),
                 item("VPN OFF", self.vpn_off_menu, checked=lambda _: self.vpn_mode == "off", radio=True),
-                item(lambda _: f"VPN Speed {self.vpn_speed_text()}", self.noop, enabled=False),
                 item("Reload", self.reload_vpn_menu),
                 item("Add Keyword", self.add_keyword_menu),
                 pystray.Menu.SEPARATOR,
