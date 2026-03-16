@@ -1,6 +1,8 @@
+import base64
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -567,29 +569,126 @@ class NodeTrayApp:
             self.write_proxy_keywords(existing)
         return added
 
-    def prompt_for_keyword_input(self) -> Optional[str]:
+
+    def _prompt_for_keyword_input_windows(self) -> Optional[str]:
+        candidates = ["powershell.exe", "pwsh.exe"]
+        powershell_exe = None
+        for candidate in candidates:
+            try:
+                resolved = shutil.which(candidate)
+            except Exception:
+                resolved = None
+            if resolved:
+                powershell_exe = resolved
+                break
+
+        if not powershell_exe:
+            raise RuntimeError("PowerShell not found")
+
+        title = f"{self.profile['profile_name']} - Add Keyword"
+        prompt = "输入要添加的 keyword。支持一次输入多个，用逗号分隔。"
+        script = f"""
+Add-Type -AssemblyName Microsoft.VisualBasic
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$value = [Microsoft.VisualBasic.Interaction]::InputBox({title!r}, {prompt!r}, "")
+if ($null -ne $value -and $value.Length -gt 0) {{
+    [Console]::Write($value)
+}}
+"""
+        encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        result = subprocess.run(
+            [
+                powershell_exe,
+                "-NoProfile",
+                "-STA",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-EncodedCommand",
+                encoded,
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=CREATE_NO_WINDOW if IS_WINDOWS else 0,
+            check=False,
+        )
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            raise RuntimeError(stderr or f"PowerShell exited with code {result.returncode}")
+
+        value = result.stdout.replace("\ufeff", "")
+        value = value.rstrip("\r\n")
+        return value or None
+
+    def _prompt_for_keyword_input_tk(self) -> Optional[str]:
         try:
             import tkinter as tk
-            from tkinter import simpledialog
         except Exception as exc:
             raise RuntimeError(f"tkinter unavailable: {exc}") from exc
 
+        result = {"value": None}
         root = tk.Tk()
-        root.withdraw()
+        root.title(f"{self.profile['profile_name']} - Add Keyword")
+        root.resizable(False, False)
         try:
+            root.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        frame = tk.Frame(root, padx=14, pady=12)
+        frame.pack(fill="both", expand=True)
+
+        label = tk.Label(frame, text="输入要添加的 keyword。支持一次输入多个，用逗号分隔。", anchor="w", justify="left")
+        label.pack(fill="x")
+
+        entry_var = tk.StringVar()
+        entry = tk.Entry(frame, textvariable=entry_var, width=52)
+        entry.pack(fill="x", pady=(10, 12))
+
+        button_bar = tk.Frame(frame)
+        button_bar.pack(fill="x")
+
+        def submit(event=None):
+            value = entry_var.get().strip()
+            result["value"] = value or None
+            root.quit()
+
+        def cancel(event=None):
+            result["value"] = None
+            root.quit()
+
+        tk.Button(button_bar, text="OK", width=10, command=submit).pack(side="right", padx=(8, 0))
+        tk.Button(button_bar, text="Cancel", width=10, command=cancel).pack(side="right")
+
+        root.bind("<Return>", submit)
+        root.bind("<Escape>", cancel)
+        root.protocol("WM_DELETE_WINDOW", cancel)
+
+        root.update_idletasks()
+        try:
+            root.lift()
+            root.focus_force()
+        except Exception:
+            pass
+        root.after(100, lambda: entry.focus_set())
+        root.mainloop()
+        root.destroy()
+        return result["value"]
+
+    def prompt_for_keyword_input(self) -> Optional[str]:
+        if IS_WINDOWS:
             try:
-                root.attributes("-topmost", True)
-            except Exception:
-                pass
-            return simpledialog.askstring(
-                title=f"{self.profile['profile_name']} - Add Keyword",
-                prompt="输入要添加的 keyword。\n支持一次输入多个，用逗号分隔。",
-                parent=root,
-            )
-        finally:
-            root.destroy()
+                return self._prompt_for_keyword_input_windows()
+            except Exception as exc:
+                self.write_log(f"Windows keyword prompt fallback to tkinter: {exc}")
+        return self._prompt_for_keyword_input_tk()
 
     def build_vpn_runtime_config(self, mode: Optional[str] = None) -> dict:
+
         mode = self.normalize_vpn_mode(mode or self.vpn_mode, True)
         template_path = self.resolve_path(
             self.vpn_cfg.get("config_template_path", self.vpn_cfg.get("config_path"))
