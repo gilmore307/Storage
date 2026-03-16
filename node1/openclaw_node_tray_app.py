@@ -1,21 +1,34 @@
 import json
 import os
+import re
 import socket
 import subprocess
+import sys
 import threading
 import time
 import traceback
 from datetime import datetime
 from pathlib import Path
+from typing import List, Optional, Sequence, Tuple
 
-import psutil
-import pystray
-from PIL import Image, ImageDraw
-from pystray import MenuItem as item
+try:
+    import psutil
+    import pystray
+    from PIL import Image, ImageDraw
+    from pystray import MenuItem as item
+except ImportError as exc:
+    missing = getattr(exc, "name", None) or str(exc)
+    raise SystemExit(
+        "Missing dependency for tray app: "
+        f"{missing}. Install them first with: pip install pystray pillow psutil"
+    ) from exc
 
+IS_WINDOWS = os.name == "nt"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0)
 PROCESS_FLAGS = CREATE_NO_WINDOW | DETACHED_PROCESS
+SCRIPT_PATH = Path(__file__).resolve()
+RUNTIME_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else SCRIPT_PATH.parent
 
 
 def load_profile(profile_path: str) -> dict:
@@ -25,36 +38,265 @@ def load_profile(profile_path: str) -> dict:
     return data
 
 
+def runtime_popen_kwargs(**kwargs):
+    if IS_WINDOWS:
+        kwargs.setdefault("creationflags", PROCESS_FLAGS)
+    return kwargs
+
+
+def _quoted_args(args: Sequence[str]) -> str:
+    return subprocess.list2cmdline([str(a) for a in args])
+
+
+def _windows_pythonw_executable() -> Optional[str]:
+    if not IS_WINDOWS:
+        return None
+
+    exe = Path(sys.executable)
+    if exe.name.lower() == "pythonw.exe":
+        return str(exe)
+
+    candidate = exe.with_name("pythonw.exe")
+    if candidate.exists():
+        return str(candidate)
+    return None
+
+
+def is_running_as_admin() -> bool:
+    if not IS_WINDOWS:
+        return True
+
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def relaunch_in_background(raw_argv: Sequence[str]) -> bool:
+    pythonw_exe = _windows_pythonw_executable()
+    if not pythonw_exe:
+        return False
+
+    new_args = [str(SCRIPT_PATH), *raw_argv[1:], "--_openclaw_pythonw_relaunched"]
+    subprocess.Popen(
+        [pythonw_exe, *new_args],
+        cwd=str(RUNTIME_DIR),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        shell=False,
+        close_fds=True,
+        **runtime_popen_kwargs(),
+    )
+    return True
+
+
+def relaunch_as_admin(raw_argv: Sequence[str]) -> bool:
+    if not IS_WINDOWS:
+        return False
+
+    try:
+        import ctypes
+    except Exception:
+        return False
+
+    executable = sys.executable
+    params = _quoted_args([str(SCRIPT_PATH), *raw_argv[1:], "--_openclaw_elevated"])
+    result = ctypes.windll.shell32.ShellExecuteW(
+        None,
+        "runas",
+        executable,
+        params,
+        str(RUNTIME_DIR),
+        1,
+    )
+    return result > 32
+
+
+def discover_profile_path(explicit_path: Optional[str] = None) -> str:
+    checked: List[Path] = []
+
+    def _accept(path_value: Optional[str]) -> Optional[str]:
+        if not path_value:
+            return None
+        path = Path(path_value).expanduser()
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+        checked.append(path)
+        if path.exists() and path.is_file():
+            return str(path)
+        return None
+
+    explicit = _accept(explicit_path)
+    if explicit:
+        return explicit
+
+    env_profile = _accept(os.environ.get("OPENCLAW_PROFILE"))
+    if env_profile:
+        return env_profile
+
+    runtime_name = Path(sys.executable if getattr(sys, "frozen", False) else SCRIPT_PATH).stem
+    direct_candidates = [
+        RUNTIME_DIR / f"{runtime_name}.profile.json",
+        SCRIPT_PATH.with_suffix(".profile.json"),
+        RUNTIME_DIR / "node-1-office.profile.json",
+    ]
+
+    for candidate in direct_candidates:
+        checked.append(candidate)
+        if candidate.exists() and candidate.is_file():
+            return str(candidate.resolve())
+
+    profile_files = sorted(RUNTIME_DIR.glob("*.profile.json"))
+    if len(profile_files) == 1:
+        return str(profile_files[0].resolve())
+
+    searched = "\n  - ".join(str(p) for p in dict.fromkeys(checked))
+
+    if profile_files:
+        available = "\n  - ".join(str(p.resolve()) for p in profile_files)
+        raise SystemExit(
+            "Multiple profile files found. Please pass --profile explicitly.\n"
+            f"Available profiles:\n  - {available}\n"
+            f"Checked default locations:\n  - {searched}"
+        )
+
+    raise SystemExit(
+        "Profile not found. Pass --profile, set OPENCLAW_PROFILE, or place one *.profile.json beside the script.\n"
+        f"Checked default locations:\n  - {searched}"
+    )
+
+
+def should_relaunch_in_background(args) -> bool:
+    if getattr(sys, "frozen", False):
+        return False
+    if not IS_WINDOWS or args.console or args.no_pythonw:
+        return False
+    if args._openclaw_pythonw_relaunched:
+        return False
+    return Path(sys.executable).name.lower() == "python.exe" and _windows_pythonw_executable() is not None
+
+
+def should_relaunch_as_admin(args, profile: dict) -> bool:
+    if getattr(sys, "frozen", False):
+        return False
+    if not IS_WINDOWS or args.no_admin or args._openclaw_elevated:
+        return False
+    if is_running_as_admin():
+        return False
+
+    app_cfg = profile.get("app", {})
+    require_admin = app_cfg.get("require_admin")
+    if require_admin is None:
+        require_admin = True
+    return bool(require_admin)
+
+
 class NodeTrayApp:
     def __init__(self, profile: dict):
-        self.profile = profile
-        self.profile_dir = Path(profile["_profile_path"]).resolve().parent
-        self.base_dir = Path(getattr(__import__("sys"), "_MEIPASS", self.profile_dir)).resolve()
-
-        self.node_cfg = profile["openclaw"]
-        self.vpn_cfg = profile["vpn"]
-        self.app_cfg = profile.get("app", {})
-
         self.stop_event = threading.Event()
         self.state_lock = threading.Lock()
         self.tray_icon = None
         self.monitor_thread = None
 
-        self.node_desired = self.app_cfg.get("auto_start_node", True)
-        self.vpn_desired = self.app_cfg.get("auto_start_vpn", False)
+        self.profile = {}
+        self.profile_path = None
+        self.profile_dir = None
+        self.node_cfg = {}
+        self.vpn_cfg = {}
+        self.app_cfg = {}
+
+        self.node_desired = True
+        self.vpn_mode = "off"
         self.node_status = False
         self.vpn_status = False
+
+        self.log_path = ""
+        self.icon_path = ""
+        self.check_interval = 10
+        self.startup_wait = 2
+        self.socket_timeout = 1.5
+        self.generated_vpn_config_path = ""
+        self.node_stdout_log_path = ""
+        self.node_stderr_log_path = ""
+        self.ssh_stdout_log_path = ""
+        self.ssh_stderr_log_path = ""
+        self.vpn_stdout_log_path = ""
+        self.vpn_stderr_log_path = ""
+        self.env = os.environ.copy()
+
+        self.apply_profile(profile, preserve_runtime_choices=False)
+
+    @staticmethod
+    def normalize_vpn_mode(mode_value, auto_start_vpn_value=None) -> str:
+        mode = str(mode_value or "").strip().lower()
+        if mode in {"on", "auto", "off"}:
+            return mode
+        return "auto" if bool(auto_start_vpn_value) else "off"
+
+    @property
+    def vpn_desired(self) -> bool:
+        return self.vpn_mode != "off"
+
+    def apply_profile(self, profile: dict, preserve_runtime_choices: bool = True):
+        old_node_desired = getattr(self, "node_desired", True)
+        old_vpn_mode = getattr(self, "vpn_mode", "off")
+
+        self.profile = profile
+        self.profile_path = Path(profile["_profile_path"]).resolve()
+        self.profile_dir = self.profile_path.parent
+
+        self.node_cfg = profile["openclaw"]
+        self.vpn_cfg = profile["vpn"]
+        self.app_cfg = profile.get("app", {})
 
         self.log_path = self.resolve_path(self.app_cfg["log_path"])
         self.icon_path = self.resolve_path(self.app_cfg["icon_path"])
         self.check_interval = self.app_cfg.get("check_interval", 10)
         self.startup_wait = self.app_cfg.get("startup_wait", 2)
         self.socket_timeout = self.app_cfg.get("socket_timeout", 1.5)
-        self.generated_vpn_config_path = self.resolve_path(self.vpn_cfg.get("generated_config_path", "generated/vpn.generated.json"))
+
+        self.generated_vpn_config_path = self.resolve_path(
+            self.vpn_cfg.get("generated_config_path", "generated/vpn.generated.json")
+        )
+        self.node_stdout_log_path = self.resolve_path(
+            self.app_cfg.get("node_stdout_log_path", "generated/node.stdout.log")
+        )
+        self.node_stderr_log_path = self.resolve_path(
+            self.app_cfg.get("node_stderr_log_path", "generated/node.stderr.log")
+        )
+        self.ssh_stdout_log_path = self.resolve_path(
+            self.app_cfg.get("ssh_stdout_log_path", "generated/ssh.stdout.log")
+        )
+        self.ssh_stderr_log_path = self.resolve_path(
+            self.app_cfg.get("ssh_stderr_log_path", "generated/ssh.stderr.log")
+        )
+        self.vpn_stdout_log_path = self.resolve_path(
+            self.app_cfg.get("vpn_stdout_log_path", "generated/vpn.stdout.log")
+        )
+        self.vpn_stderr_log_path = self.resolve_path(
+            self.app_cfg.get("vpn_stderr_log_path", "generated/vpn.stderr.log")
+        )
 
         self.env = os.environ.copy()
-        self.env["OPENCLAW_GATEWAY_TOKEN"] = self.node_cfg["gateway_token"]
+        self.env["OPENCLAW_GATEWAY_TOKEN"] = str(self.node_cfg["gateway_token"]).strip()
+        self.env.pop("OPENCLAW_GATEWAY_PASSWORD", None)
         self.env["OPENCLAW_ALLOW_INSECURE_PRIVATE_WS"] = "1"
+
+        if preserve_runtime_choices:
+            self.node_desired = old_node_desired
+            self.vpn_mode = old_vpn_mode
+        else:
+            self.node_desired = bool(self.app_cfg.get("auto_start_node", True))
+            self.vpn_mode = self.normalize_vpn_mode(
+                self.app_cfg.get("auto_start_vpn_mode"),
+                self.app_cfg.get("auto_start_vpn", True),
+            )
+
+    def reload_profile_from_disk(self, preserve_runtime_choices: bool = True):
+        self.apply_profile(load_profile(str(self.profile_path)), preserve_runtime_choices=preserve_runtime_choices)
 
     def resolve_path(self, path_value: str) -> str:
         p = Path(path_value)
@@ -64,6 +306,9 @@ class NodeTrayApp:
 
     def ensure_log_dir(self):
         Path(self.log_path).parent.mkdir(parents=True, exist_ok=True)
+
+    def ensure_parent_dir(self, path_value: str):
+        Path(path_value).parent.mkdir(parents=True, exist_ok=True)
 
     def write_log(self, msg: str):
         self.ensure_log_dir()
@@ -100,89 +345,6 @@ class NodeTrayApp:
     def _contains_flag_with_value(self, cmdline: str, flag: str, value: str) -> bool:
         return f"{flag} {value}".lower() in cmdline.lower()
 
-    def is_node_process(self, proc) -> bool:
-        name = self._safe_name(proc)
-        cmdline = self._safe_cmdline(proc).lower()
-        return (
-            name == Path(self.resolve_path(self.node_cfg["nodejs_path"])).name.lower()
-            and self.resolve_path(self.node_cfg["openclaw_path"]).lower() in cmdline
-            and self._contains_flag_with_value(cmdline, "--display-name", self.node_cfg["display_name"].lower())
-            and self._contains_flag_with_value(cmdline, "--port", str(self.node_cfg["node_port"]))
-        )
-
-    def is_ssh_process(self, proc) -> bool:
-        tunnel = self.node_cfg.get("ssh_tunnel")
-        if not tunnel or not tunnel.get("enabled"):
-            return False
-        name = self._safe_name(proc)
-        cmdline = self._safe_cmdline(proc).lower()
-        expected_forward = f"{self.node_cfg['gateway_tunnel_local_port']}:127.0.0.1:{self.node_cfg['remote_port']}".lower()
-        expected_host = f"{tunnel['ssh_user']}@{tunnel['ssh_host']}".lower()
-        return name == "ssh.exe" and expected_forward in cmdline and expected_host in cmdline
-
-    def is_vpn_process(self, proc) -> bool:
-        name = self._safe_name(proc)
-        cmdline = self._safe_cmdline(proc).lower()
-        exe_name = Path(self.resolve_path(self.vpn_cfg["singbox_exe"])).name.lower()
-        config_path = self.generated_vpn_config_path.lower()
-        return name == exe_name and config_path in cmdline and " run " in f" {cmdline} "
-
-    def extract_proxy_keywords(self) -> list[str]:
-        keyword_file = self.vpn_cfg.get("keyword_file_path")
-        if not keyword_file:
-            return self.vpn_cfg.get("default_keywords", [])
-
-        path = self.resolve_path(keyword_file)
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-
-        in_section = False
-        keywords = []
-        for raw in lines:
-            line = raw.strip()
-            if line.startswith("## "):
-                if line == "## Current proxy keywords":
-                    in_section = True
-                    continue
-                if in_section:
-                    break
-            if not in_section:
-                continue
-            if line.startswith("- `") and line.endswith("`"):
-                keywords.append(line[3:-1])
-            elif line.startswith("- "):
-                keywords.append(line[2:].strip())
-
-        if not keywords:
-            keywords = self.vpn_cfg.get("default_keywords", [])
-        return [k for k in keywords if k]
-
-    def generate_vpn_runtime_config(self) -> str:
-        template_path = self.resolve_path(self.vpn_cfg.get("config_template_path", self.vpn_cfg.get("config_path")))
-        with open(template_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-
-        keywords = self.extract_proxy_keywords()
-        for rule in config.get("route", {}).get("rules", []):
-            if "domain_keyword" in rule:
-                rule["domain_keyword"] = keywords
-
-        cert_path_value = self.vpn_cfg.get("cert_path")
-        if cert_path_value:
-            resolved_cert_path = self.resolve_path(cert_path_value)
-            for outbound in config.get("outbounds", []):
-                tls_cfg = outbound.get("tls")
-                if isinstance(tls_cfg, dict) and tls_cfg.get("certificate_path"):
-                    tls_cfg["certificate_path"] = resolved_cert_path
-
-        out_path = Path(getattr(self, "generated_vpn_config_path", self.resolve_path(self.vpn_cfg.get("generated_config_path", "generated/vpn.generated.json"))))
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-        self.write_log(f"Generated VPN runtime config at {out_path} with keywords: {', '.join(keywords)}")
-        return str(out_path)
-
     def find_processes(self, predicate):
         results = []
         for proc in self._iter_processes(["pid", "name", "cmdline"]):
@@ -214,80 +376,377 @@ class NodeTrayApp:
     def is_gateway_reachable(self, host: str, port: int, timeout: float) -> bool:
         return self.is_local_port_open(host, port, timeout)
 
-    def choose_gateway_url(self) -> str:
-        direct = self.node_cfg["direct_gateway_url"]
-        if self.node_cfg.get("prefer_direct", True):
-            host = self.node_cfg["direct_gateway_host"]
-            port = int(self.node_cfg["direct_gateway_port"])
-            if self.is_gateway_reachable(host, port, self.socket_timeout):
+    def choose_gateway_target(self, log_decision: bool = True) -> Tuple[str, str, int, bool]:
+        direct_url = self.node_cfg["direct_gateway_url"]
+        direct_host = self.node_cfg["direct_gateway_host"]
+        direct_port = int(self.node_cfg["direct_gateway_port"])
+
+        prefer_direct = self.node_cfg.get("prefer_direct", True)
+        if prefer_direct and self.is_gateway_reachable(direct_host, direct_port, self.socket_timeout):
+            if log_decision:
                 self.write_log("Direct gateway reachable. Using direct path.")
-                return direct
+            return direct_url, direct_host, direct_port, False
+
         tunnel = self.node_cfg.get("ssh_tunnel")
         if tunnel and tunnel.get("enabled"):
-            self.write_log("Falling back to SSH tunnel path.")
-            return self.node_cfg["tunnel_gateway_url"]
-        self.write_log("Using direct gateway path without SSH tunnel fallback.")
-        return direct
+            tunnel_url = self.node_cfg["tunnel_gateway_url"]
+            tunnel_host = "127.0.0.1"
+            tunnel_port = int(self.node_cfg["gateway_tunnel_local_port"])
+            if log_decision:
+                self.write_log("Falling back to SSH tunnel path.")
+            return tunnel_url, tunnel_host, tunnel_port, True
+
+        if log_decision:
+            self.write_log("Using direct gateway path without SSH tunnel fallback.")
+        return direct_url, direct_host, direct_port, False
 
     def build_node_env(self, gateway_url: str):
         env = self.env.copy()
         env["OPENCLAW_GATEWAY_URL"] = gateway_url
         return env
 
+    def _open_subprocess_logs(self, stdout_path: str, stderr_path: str):
+        self.ensure_parent_dir(stdout_path)
+        self.ensure_parent_dir(stderr_path)
+        stdout_f = open(stdout_path, "a", encoding="utf-8")
+        stderr_f = open(stderr_path, "a", encoding="utf-8")
+        return stdout_f, stderr_f
+
+    def is_node_process(self, proc) -> bool:
+        name = self._safe_name(proc)
+        cmdline = self._safe_cmdline(proc).lower()
+
+        expected_node_exe = Path(self.resolve_path(self.node_cfg["nodejs_path"])).name.lower()
+        expected_openclaw_path = self.resolve_path(self.node_cfg["openclaw_path"]).lower()
+        expected_display_name = self.node_cfg["display_name"].lower()
+
+        expected_ports = {
+            str(self.node_cfg["direct_gateway_port"]).lower(),
+            str(self.node_cfg["gateway_tunnel_local_port"]).lower(),
+        }
+
+        return (
+            name == expected_node_exe
+            and expected_openclaw_path in cmdline
+            and self._contains_flag_with_value(cmdline, "--display-name", expected_display_name)
+            and any(self._contains_flag_with_value(cmdline, "--port", p) for p in expected_ports)
+        )
+
+    def is_ssh_process(self, proc) -> bool:
+        tunnel = self.node_cfg.get("ssh_tunnel")
+        if not tunnel or not tunnel.get("enabled"):
+            return False
+
+        name = self._safe_name(proc)
+        cmdline = self._safe_cmdline(proc).lower()
+
+        expected_forward = (
+            f"{self.node_cfg['gateway_tunnel_local_port']}:127.0.0.1:{self.node_cfg['remote_port']}".lower()
+        )
+        expected_host = f"{tunnel['ssh_user']}@{tunnel['ssh_host']}".lower()
+
+        return name in ("ssh.exe", "ssh") and expected_forward in cmdline and expected_host in cmdline
+
+    def is_vpn_process(self, proc) -> bool:
+        name = self._safe_name(proc)
+        cmdline = self._safe_cmdline(proc).lower()
+        exe_name = Path(self.resolve_path(self.vpn_cfg["singbox_exe"])).name.lower()
+        config_path = self.generated_vpn_config_path.lower()
+        return name == exe_name and config_path in cmdline and " run " in f" {cmdline} "
+
+    @staticmethod
+    def _normalize_keyword_text(value: str) -> str:
+        text = str(value or "").strip()
+        text = text.strip("`")
+        if text.startswith("- "):
+            text = text[2:].strip()
+        return text
+
+    def keyword_file_path(self) -> str:
+        return self.resolve_path(self.vpn_cfg["keyword_file_path"])
+
+    def extract_proxy_keywords(self) -> List[str]:
+        path = self.keyword_file_path()
+        if not Path(path).exists():
+            return []
+
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        in_section = False
+        keywords = []
+        for raw in lines:
+            line = raw.strip()
+            if line.startswith("## "):
+                if line == "## Current proxy keywords":
+                    in_section = True
+                    continue
+                if in_section:
+                    break
+
+            if not in_section:
+                continue
+
+            if line.startswith("- "):
+                keyword = self._normalize_keyword_text(line[2:])
+                if keyword:
+                    keywords.append(keyword)
+
+        seen = set()
+        deduped = []
+        for keyword in keywords:
+            lowered = keyword.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            deduped.append(keyword)
+        return deduped
+
+    def write_proxy_keywords(self, keywords: List[str]):
+        path = Path(self.keyword_file_path())
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        normalized = []
+        seen = set()
+        for keyword in keywords:
+            cleaned = self._normalize_keyword_text(keyword)
+            if not cleaned:
+                continue
+            lowered = cleaned.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            normalized.append(cleaned)
+
+        bullet_lines = [f"- `{keyword}`" for keyword in normalized]
+        replacement_body = "\n".join(bullet_lines)
+        if replacement_body:
+            replacement_body += "\n\n"
+        else:
+            replacement_body = "\n"
+
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+        pattern = re.compile(
+            r"(^## Current proxy keywords\s*\n)(.*?)(?=^##\s|\Z)",
+            re.MULTILINE | re.DOTALL,
+        )
+
+        if pattern.search(existing):
+            updated = pattern.sub(rf"\1{replacement_body}", existing, count=1)
+        else:
+            prefix = existing.rstrip()
+            if prefix:
+                prefix += "\n\n"
+            updated = prefix + "## Current proxy keywords\n" + replacement_body
+
+        path.write_text(updated, encoding="utf-8")
+        self.write_log(f"Updated proxy keyword file: {path}")
+
+    def add_proxy_keywords(self, raw_input: str) -> List[str]:
+        incoming = [
+            self._normalize_keyword_text(part)
+            for part in re.split(r"[,\r\n]+", raw_input or "")
+        ]
+        incoming = [value for value in incoming if value]
+        if not incoming:
+            return []
+
+        existing = self.extract_proxy_keywords()
+        existing_lower = {keyword.lower() for keyword in existing}
+        added = []
+        for keyword in incoming:
+            if keyword.lower() in existing_lower:
+                continue
+            existing.append(keyword)
+            existing_lower.add(keyword.lower())
+            added.append(keyword)
+
+        if added:
+            self.write_proxy_keywords(existing)
+        return added
+
+    def prompt_for_keyword_input(self) -> Optional[str]:
+        try:
+            import tkinter as tk
+            from tkinter import simpledialog
+        except Exception as exc:
+            raise RuntimeError(f"tkinter unavailable: {exc}") from exc
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            try:
+                root.attributes("-topmost", True)
+            except Exception:
+                pass
+            return simpledialog.askstring(
+                title=f"{self.profile['profile_name']} - Add Keyword",
+                prompt="输入要添加的 keyword。\n支持一次输入多个，用逗号分隔。",
+                parent=root,
+            )
+        finally:
+            root.destroy()
+
+    def build_vpn_runtime_config(self, mode: Optional[str] = None) -> dict:
+        mode = self.normalize_vpn_mode(mode or self.vpn_mode, True)
+        template_path = self.resolve_path(
+            self.vpn_cfg.get("config_template_path", self.vpn_cfg.get("config_path"))
+        )
+
+        with open(template_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+
+        route = config.setdefault("route", {})
+        rules = route.get("rules", [])
+
+        cert_path_value = self.vpn_cfg.get("cert_path")
+        if cert_path_value:
+            resolved_cert_path = self.resolve_path(cert_path_value)
+            for outbound in config.get("outbounds", []):
+                tls_cfg = outbound.get("tls")
+                if isinstance(tls_cfg, dict) and tls_cfg.get("certificate_path"):
+                    tls_cfg["certificate_path"] = resolved_cert_path
+
+        if mode == "on":
+            keep_rules = []
+            for rule in rules:
+                if rule.get("action") == "sniff":
+                    keep_rules.append(rule)
+                    continue
+                if rule.get("protocol") == "dns" and rule.get("action") == "hijack-dns":
+                    keep_rules.append(rule)
+            route["rules"] = keep_rules
+            route["final"] = "proxy"
+        else:
+            keywords = self.extract_proxy_keywords()
+            for rule in rules:
+                if "domain_keyword" in rule:
+                    rule["domain_keyword"] = keywords
+            route["rules"] = rules
+            route["final"] = "direct"
+
+        return config
+
+    def generate_vpn_runtime_config(self, mode: Optional[str] = None) -> str:
+        mode = self.normalize_vpn_mode(mode or self.vpn_mode, True)
+        config = self.build_vpn_runtime_config(mode)
+        out_path = Path(self.generated_vpn_config_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+
+        keywords = self.extract_proxy_keywords() if mode == "auto" else []
+        self.write_log(
+            f"Generated VPN runtime config at {out_path} | mode={mode}"
+            + (f" | keywords={', '.join(keywords)}" if keywords else "")
+        )
+        return str(out_path)
+
     def start_ssh_tunnel(self):
         tunnel = self.node_cfg.get("ssh_tunnel")
         if not tunnel or not tunnel.get("enabled"):
             return
+
         self.kill_processes(self.find_processes(self.is_ssh_process), "ssh")
         self.write_log("Starting SSH tunnel...")
-        subprocess.Popen(
-            [
-                tunnel.get("ssh_exe", "ssh"),
-                "-N",
-                "-o", "ExitOnForwardFailure=yes",
-                "-o", "ServerAliveInterval=30",
-                "-o", "ServerAliveCountMax=3",
-                "-L", f"{self.node_cfg['gateway_tunnel_local_port']}:127.0.0.1:{self.node_cfg['remote_port']}",
-                f"{tunnel['ssh_user']}@{tunnel['ssh_host']}",
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            shell=False,
-            creationflags=PROCESS_FLAGS,
-        )
+
+        stdout_f = None
+        stderr_f = None
+        try:
+            stdout_f, stderr_f = self._open_subprocess_logs(
+                self.ssh_stdout_log_path, self.ssh_stderr_log_path
+            )
+
+            subprocess.Popen(
+                [
+                    tunnel.get("ssh_exe", "ssh"),
+                    "-N",
+                    "-o", "ExitOnForwardFailure=yes",
+                    "-o", "ServerAliveInterval=30",
+                    "-o", "ServerAliveCountMax=3",
+                    "-L", f"{self.node_cfg['gateway_tunnel_local_port']}:127.0.0.1:{self.node_cfg['remote_port']}",
+                    f"{tunnel['ssh_user']}@{tunnel['ssh_host']}",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_f,
+                stderr=stderr_f,
+                shell=False,
+                **runtime_popen_kwargs(),
+            )
+        finally:
+            if stdout_f:
+                stdout_f.close()
+            if stderr_f:
+                stderr_f.close()
+
         deadline = time.time() + max(self.startup_wait, 8)
         while time.time() < deadline:
-            if self.is_local_port_open("127.0.0.1", int(self.node_cfg["gateway_tunnel_local_port"]), self.socket_timeout):
+            if self.is_local_port_open(
+                "127.0.0.1",
+                int(self.node_cfg["gateway_tunnel_local_port"]),
+                self.socket_timeout,
+            ):
                 self.write_log("SSH tunnel local port is ready.")
                 return
             time.sleep(0.5)
+
         self.write_log("SSH tunnel local port did not become ready before timeout.")
 
     def start_node(self):
-        gateway_url = self.choose_gateway_url()
-        if gateway_url == self.node_cfg.get("tunnel_gateway_url"):
+        gateway_url, gateway_host, gateway_port, use_tunnel = self.choose_gateway_target(log_decision=True)
+
+        if use_tunnel:
             self.start_ssh_tunnel()
+
         self.kill_processes(self.find_processes(self.is_node_process), "node")
-        self.write_log(f"Starting OpenClaw node using gateway: {gateway_url}")
-        subprocess.Popen(
-            [
-                self.resolve_path(self.node_cfg["nodejs_path"]),
-                self.resolve_path(self.node_cfg["openclaw_path"]),
-                "node",
-                "run",
-                "--host", self.node_cfg.get("bind_host", "127.0.0.1"),
-                "--port", str(self.node_cfg["gateway_tunnel_local_port"]),
-                "--display-name", self.node_cfg["display_name"],
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            shell=False,
-            creationflags=PROCESS_FLAGS,
-            env=self.build_node_env(gateway_url),
+        self.write_log(
+            f"Starting OpenClaw node using gateway: {gateway_url} | target={gateway_host}:{gateway_port}"
         )
+
+        stdout_f = None
+        stderr_f = None
+        proc = None
+
+        try:
+            stdout_f, stderr_f = self._open_subprocess_logs(
+                self.node_stdout_log_path, self.node_stderr_log_path
+            )
+
+            proc = subprocess.Popen(
+                [
+                    self.resolve_path(self.node_cfg["nodejs_path"]),
+                    self.resolve_path(self.node_cfg["openclaw_path"]),
+                    "node",
+                    "run",
+                    "--host", gateway_host,
+                    "--port", str(gateway_port),
+                    "--display-name", self.node_cfg["display_name"],
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_f,
+                stderr=stderr_f,
+                shell=False,
+                env=self.build_node_env(gateway_url),
+                **runtime_popen_kwargs(),
+            )
+        finally:
+            if stdout_f:
+                stdout_f.close()
+            if stderr_f:
+                stderr_f.close()
+
         time.sleep(self.startup_wait)
+
+        if proc is not None:
+            ret = proc.poll()
+            if ret is not None:
+                self.write_log(
+                    f"OpenClaw node exited immediately with code={ret}. "
+                    f"See logs: {self.node_stdout_log_path}, {self.node_stderr_log_path}"
+                )
+
         self.node_status = self.check_node_status()
         self.refresh_ui()
 
@@ -299,22 +758,40 @@ class NodeTrayApp:
         self.refresh_ui()
 
     def start_vpn(self):
+        if self.vpn_mode == "off":
+            self.stop_vpn()
+            return
+
         self.kill_processes(self.find_processes(self.is_vpn_process), "vpn")
-        runtime_config = self.generate_vpn_runtime_config()
-        self.write_log(f"Starting sing-box VPN with config: {runtime_config}")
-        subprocess.Popen(
-            [
-                self.resolve_path(self.vpn_cfg["singbox_exe"]),
-                "run",
-                "-c",
-                runtime_config,
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            shell=False,
-            creationflags=PROCESS_FLAGS,
-        )
+        runtime_config = self.generate_vpn_runtime_config(self.vpn_mode)
+        self.write_log(f"Starting sing-box VPN with config: {runtime_config} | mode={self.vpn_mode}")
+
+        stdout_f = None
+        stderr_f = None
+        try:
+            stdout_f, stderr_f = self._open_subprocess_logs(
+                self.vpn_stdout_log_path, self.vpn_stderr_log_path
+            )
+
+            subprocess.Popen(
+                [
+                    self.resolve_path(self.vpn_cfg["singbox_exe"]),
+                    "run",
+                    "-c",
+                    runtime_config,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_f,
+                stderr=stderr_f,
+                shell=False,
+                **runtime_popen_kwargs(),
+            )
+        finally:
+            if stdout_f:
+                stdout_f.close()
+            if stderr_f:
+                stderr_f.close()
+
         time.sleep(self.startup_wait)
         self.vpn_status = self.check_vpn_status()
         self.refresh_ui()
@@ -325,13 +802,32 @@ class NodeTrayApp:
         self.vpn_status = False
         self.refresh_ui()
 
+    def reload_vpn_locked(self, icon=None, reason: Optional[str] = None):
+        self.stop_vpn()
+        self.reload_profile_from_disk(preserve_runtime_choices=True)
+        if self.vpn_mode != "off":
+            self.start_vpn()
+        else:
+            self.vpn_status = False
+            self.refresh_ui()
+
+        message = reason or f"VPN reloaded ({self.vpn_mode.upper()})"
+        self.write_log(message)
+        if icon:
+            icon.notify(message, self.profile["profile_name"])
+
     def check_node_status(self) -> bool:
-        node_ok = len(self.find_processes(self.is_node_process)) > 0
-        if not node_ok:
+        node_procs = self.find_processes(self.is_node_process)
+        if not node_procs:
             return False
-        gateway_url = self.choose_gateway_url()
-        if gateway_url == self.node_cfg.get("tunnel_gateway_url"):
-            return len(self.find_processes(self.is_ssh_process)) > 0 and self.is_local_port_open("127.0.0.1", int(self.node_cfg["gateway_tunnel_local_port"]), self.socket_timeout)
+
+        if len(self.find_processes(self.is_ssh_process)) > 0:
+            return self.is_local_port_open(
+                "127.0.0.1",
+                int(self.node_cfg["gateway_tunnel_local_port"]),
+                self.socket_timeout,
+            )
+
         return True
 
     def check_vpn_status(self) -> bool:
@@ -344,76 +840,123 @@ class NodeTrayApp:
     def make_status_icon(self) -> Image.Image:
         base = self.load_base_icon().copy()
         draw = ImageDraw.Draw(base)
+
         colors = [
             (0, 180, 0, 255) if self.node_status else (180, 0, 0, 255),
             (0, 180, 255, 255) if self.vpn_status else (100, 100, 100, 255),
         ]
         positions = [(50, 16), (50, 48)]
         radius = 8
+
         for (cx, cy), color in zip(positions, colors):
-            draw.ellipse((cx - radius - 2, cy - radius - 2, cx + radius + 2, cy + radius + 2), fill=(255, 255, 255, 255))
-            draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=color)
+            draw.ellipse(
+                (cx - radius - 2, cy - radius - 2, cx + radius + 2, cy + radius + 2),
+                fill=(255, 255, 255, 255),
+            )
+            draw.ellipse(
+                (cx - radius, cy - radius, cx + radius, cy + radius),
+                fill=color,
+            )
+
         return base
 
     def refresh_ui(self):
         if self.tray_icon is None:
             return
+
         try:
             self.tray_icon.icon = self.make_status_icon()
-            self.tray_icon.title = f"{self.profile['profile_name']} | node={'ON' if self.node_status else 'OFF'} | vpn={'ON' if self.vpn_status else 'OFF'}"
+            self.tray_icon.title = (
+                f"{self.profile['profile_name']} | "
+                f"node={'ON' if self.node_status else 'OFF'} | "
+                f"vpn={self.vpn_mode.upper()} ({'UP' if self.vpn_status else 'DOWN'})"
+            )
             self.tray_icon.update_menu()
         except Exception as e:
             self.write_log(f"refresh_ui error: {e}")
 
-    def status_label(self, _):
-        return f"Node: {'ON' if self.node_status else 'OFF'} | VPN: {'ON' if self.vpn_status else 'OFF'}"
-
     def noop(self, icon=None, menu_item=None):
         return
 
-    def start_node_menu(self, icon=None, menu_item=None):
-        with self.state_lock:
-            self.node_desired = True
+    def set_node_desired(self, desired: bool, icon=None):
+        self.node_desired = desired
+        if desired:
             self.start_node()
             if icon:
-                icon.notify("OpenClaw node started", self.profile['profile_name'])
-
-    def stop_node_menu(self, icon=None, menu_item=None):
-        with self.state_lock:
-            self.node_desired = False
+                icon.notify("OpenClaw node started", self.profile["profile_name"])
+        else:
             self.stop_node()
             if icon:
-                icon.notify("OpenClaw node stopped", self.profile['profile_name'])
+                icon.notify("OpenClaw node stopped", self.profile["profile_name"])
 
-    def start_vpn_menu(self, icon=None, menu_item=None):
-        with self.state_lock:
-            self.vpn_desired = True
+    def set_vpn_mode(self, mode: str, icon=None):
+        self.vpn_mode = self.normalize_vpn_mode(mode, True)
+        self.stop_vpn()
+        if self.vpn_mode != "off":
             self.start_vpn()
-            if icon:
-                icon.notify("VPN started", self.profile['profile_name'])
+        else:
+            self.refresh_ui()
+        if icon:
+            icon.notify(f"VPN mode switched to {self.vpn_mode.upper()}", self.profile["profile_name"])
 
-    def stop_vpn_menu(self, icon=None, menu_item=None):
+    def node_on_menu(self, icon=None, menu_item=None):
         with self.state_lock:
-            self.vpn_desired = False
-            self.stop_vpn()
-            if icon:
-                icon.notify("VPN stopped", self.profile['profile_name'])
+            self.set_node_desired(True, icon=icon)
 
-    def restart_all(self, icon=None, menu_item=None):
+    def node_off_menu(self, icon=None, menu_item=None):
+        with self.state_lock:
+            self.set_node_desired(False, icon=icon)
+
+    def vpn_on_menu(self, icon=None, menu_item=None):
+        with self.state_lock:
+            self.set_vpn_mode("on", icon=icon)
+
+    def vpn_auto_menu(self, icon=None, menu_item=None):
+        with self.state_lock:
+            self.set_vpn_mode("auto", icon=icon)
+
+    def vpn_off_menu(self, icon=None, menu_item=None):
+        with self.state_lock:
+            self.set_vpn_mode("off", icon=icon)
+
+    def reload_vpn_menu(self, icon=None, menu_item=None):
         try:
             with self.state_lock:
-                self.stop_vpn()
-                self.stop_node()
-                if self.node_desired:
-                    self.start_node()
-                if self.vpn_desired:
-                    self.start_vpn()
-                if icon:
-                    icon.notify("Restarted configured services", self.profile['profile_name'])
+                self.reload_vpn_locked(icon=icon)
         except Exception as e:
-            self.write_exception("restart_all error", e)
+            self.write_exception("reload_vpn_menu error", e)
             if icon:
-                icon.notify(f"Restart failed: {e}", self.profile['profile_name'])
+                icon.notify(f"VPN reload failed: {e}", self.profile["profile_name"])
+
+    def add_keyword_menu(self, icon=None, menu_item=None):
+        try:
+            raw_input = self.prompt_for_keyword_input()
+        except Exception as e:
+            self.write_exception("add_keyword prompt error", e)
+            if icon:
+                icon.notify(f"Add Keyword failed: {e}", self.profile["profile_name"])
+            return
+
+        if raw_input is None:
+            return
+
+        try:
+            with self.state_lock:
+                added = self.add_proxy_keywords(raw_input)
+                if not added:
+                    message = "No new keyword added"
+                    self.write_log(message)
+                    if icon:
+                        icon.notify(message, self.profile["profile_name"])
+                    return
+                self.reload_vpn_locked(
+                    icon=icon,
+                    reason=f"Added keyword: {', '.join(added)} | VPN reloaded",
+                )
+        except Exception as e:
+            self.write_exception("add_keyword_menu error", e)
+            if icon:
+                icon.notify(f"Add Keyword failed: {e}", self.profile["profile_name"])
 
     def on_exit(self, icon=None, menu_item=None):
         self.write_log("Exit requested.")
@@ -434,62 +977,79 @@ class NodeTrayApp:
                     self.refresh_ui()
             except Exception as e:
                 self.write_exception("monitor_loop error", e)
+
             self.stop_event.wait(self.check_interval)
+
         self.write_log("Monitor thread exited.")
 
     def run(self):
         self.write_log("Tray app started.")
-        if self.node_desired:
-            self.start_node()
-        if self.vpn_desired:
-            self.start_vpn()
-        self.node_status = self.check_node_status()
-        self.vpn_status = self.check_vpn_status()
 
         self.tray_icon = pystray.Icon(
             self.profile["profile_name"],
             self.make_status_icon(),
             self.profile["profile_name"],
             menu=pystray.Menu(
-                item(self.status_label, self.noop),
+                item("Node ON", self.node_on_menu, checked=lambda _: self.node_desired, radio=True),
+                item("Node OFF", self.node_off_menu, checked=lambda _: not self.node_desired, radio=True),
                 pystray.Menu.SEPARATOR,
-                item("Start Node", self.start_node_menu),
-                item("Stop Node", self.stop_node_menu),
-                item("Start VPN", self.start_vpn_menu),
-                item("Stop VPN", self.stop_vpn_menu),
-                item("Restart All", self.restart_all),
+                item("VPN ON", self.vpn_on_menu, checked=lambda _: self.vpn_mode == "on", radio=True),
+                item("VPN AUTO", self.vpn_auto_menu, checked=lambda _: self.vpn_mode == "auto", radio=True),
+                item("VPN OFF", self.vpn_off_menu, checked=lambda _: self.vpn_mode == "off", radio=True),
+                item("Reload", self.reload_vpn_menu),
+                item("Add Keyword", self.add_keyword_menu),
+                pystray.Menu.SEPARATOR,
                 item("Exit", self.on_exit),
             ),
         )
+
         self.monitor_thread = threading.Thread(target=self.monitor_loop, daemon=True)
         self.monitor_thread.start()
+
+        with self.state_lock:
+            if self.node_desired:
+                self.start_node()
+
+            if self.vpn_mode != "off":
+                self.start_vpn()
+
+            self.node_status = self.check_node_status()
+            self.vpn_status = self.check_vpn_status()
+            self.refresh_ui()
+
         self.tray_icon.run()
 
 
 def main():
     import argparse
-    import sys
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", help="Path to profile json")
+    parser.add_argument("--console", action="store_true", help="Keep the console window attached")
+    parser.add_argument("--no-pythonw", action="store_true", help="Do not relaunch with pythonw.exe")
+    parser.add_argument("--no-admin", action="store_true", help="Do not request Windows admin elevation")
+    parser.add_argument("--_openclaw_pythonw_relaunched", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--_openclaw_elevated", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    profile_path = args.profile
-    if not profile_path:
-        exe_path = Path(sys.executable if getattr(sys, 'frozen', False) else __file__).resolve()
-        candidate = exe_path.with_suffix('.profile.json')
-        if candidate.exists():
-            profile_path = str(candidate)
-        else:
-            script_candidate = Path(__file__).resolve().with_name(exe_path.stem + '.profile.json')
-            if script_candidate.exists():
-                profile_path = str(script_candidate)
-
-    if not profile_path:
-        raise SystemExit('Profile not found. Pass --profile or place <exe-name>.profile.json beside the executable.')
-
+    profile_path = discover_profile_path(args.profile)
     profile = load_profile(profile_path)
+
+    if should_relaunch_in_background(args):
+        if relaunch_in_background(sys.argv):
+            return
+
+    if should_relaunch_as_admin(args, profile):
+        if relaunch_as_admin(sys.argv):
+            return
+        raise SystemExit("Administrator permission is required to run this tray app.")
+
     app = NodeTrayApp(profile)
+    app.write_log(
+        "Starting tray from source runtime. "
+        f"profile={profile_path} | elevated={'yes' if is_running_as_admin() else 'no'} | "
+        f"console={'yes' if args.console else 'no'}"
+    )
     app.run()
 
 

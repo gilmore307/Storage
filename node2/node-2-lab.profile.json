@@ -4,14 +4,15 @@
     "icon_path": "resources/OpenClaw.jfif",
     "log_path": "logs/node-2-lab.log",
     "auto_start_node": true,
-    "auto_start_vpn": false,
+    "auto_start_vpn": true,
     "check_interval": 10,
     "startup_wait": 2,
-    "socket_timeout": 1.5
+    "socket_timeout": 1.5,
+    "auto_start_vpn_mode": "auto"
   },
   "openclaw": {
     "display_name": "node-2-lab",
-    "gateway_token": "REPLACE_GATEWAY_TOKEN",
+    "gateway_token": "40ec3c89f1cfda3e2db02edc54d0682759968b02575d771b",
     "nodejs_path": "C:/Program Files/nodejs/node.exe",
     "openclaw_path": "C:/Users/sunch/AppData/Roaming/npm/node_modules/openclaw/dist/index.js",
     "bind_host": "127.0.0.1",
@@ -35,13 +36,6 @@
     "config_template_path": "resources/config-tun-rule.template.json",
     "cert_path": "resources/server.crt",
     "generated_config_path": "generated/node-2-lab.config-tun-rule.generated.json",
-    "keyword_file_path": "resources/tun-rule-proxy-keywords.md",
-    "default_keywords": [
-      "google",
-      "youtube",
-      "openai",
-      "anthropic",
-      "github"
-    ]
+    "keyword_file_path": "resources/tun-rule-proxy-keywords.md"
   }
 }

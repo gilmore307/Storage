@@ -1,12 +1,11 @@
 # TUN Rule-Mode Proxy Keywords
 
-## Purpose
-This file is the human-editable source of truth for the current **keyword-based proxy rules** used by the first-pass TUN rule-mode configs.
+这是 **唯一的关键词配置入口**。
 
-Current intent:
-- domestic sites should prefer `direct`
-- selected overseas / blocked / developer services should prefer `proxy`
-- private/LAN traffic should stay `direct`
+- `VPN AUTO` 会读取这里的关键词
+- `VPN ON` 不看关键词，直接让全部流量走代理
+- 修改这个文件后，在托盘菜单点击 `Reload` 就会重新加载并生效
+- 也可以直接用托盘菜单里的 `Add Keyword` 快捷追加，保存后会自动 `Reload`
 
 ## Current proxy keywords
 - `google`
@@ -14,11 +13,11 @@ Current intent:
 - `openai`
 - `anthropic`
 - `github`
+- `discord`
 
 ## How to extend
-When you find a site or service that should consistently go through the proxy, add one keyword per bullet here.
+一行一个关键词，继续按下面这种 bullet 形式追加就行：
 
-Examples:
 - `x`
 - `twitter`
 - `telegram`
@@ -26,27 +25,16 @@ Examples:
 - `notion`
 - `claude`
 
-## Practical rule of thumb
-Prefer keywords only when they are stable and obvious.
+## Rule of thumb
+优先写稳定、辨识度高、不会误伤国内站点的关键词。
 
-Good candidates:
-- service/product names
-- main domain identity words
-- tooling/vendor names that are unlikely to collide with domestic sites
+适合：
+- 服务名
+- 产品名
+- 主域名识别词
+- 明确的厂商名
 
-Avoid:
-- very short generic words
-- words likely to appear on unrelated Chinese sites
-- huge mixed lists without testing
-
-## Important note
-This file is documentation / operator source-of-truth.
-The current sing-box JSON configs still contain their own inline rule arrays, so config files must be updated after editing this file.
-
-Current files that should stay aligned:
-- `projects/Storage/network-framework/node1/config-tun-rule.json`
-- `projects/Storage/network-framework/node2/config-tun-rule.json`
-- `node/config/singbox-client-tun-rule-template.json`
-
-## Next possible improvement
-If this keyword list grows, convert it into a machine-readable source and generate the JSON configs from it instead of editing all copies by hand.
+避免：
+- 太短的通用词
+- 容易和无关网站撞上的词
+- 一次性堆很多没验证过的词

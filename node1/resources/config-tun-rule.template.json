@@ -79,13 +79,7 @@
         "outbound": "direct"
       },
       {
-        "domain_keyword": [
-          "google",
-          "youtube",
-          "openai",
-          "anthropic",
-          "github"
-        ],
+        "domain_keyword": [],
         "outbound": "proxy"
       }
     ],
