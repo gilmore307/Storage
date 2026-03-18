@@ -196,6 +196,13 @@ def should_relaunch_as_admin(args, profile: dict) -> bool:
     return bool(require_admin)
 
 
+def _norm_path_text(value: str) -> str:
+    try:
+        return os.path.normcase(os.path.normpath(str(value).strip().strip('"')))
+    except Exception:
+        return str(value).strip().strip('"').lower()
+
+
 class NodeTrayApp:
     def __init__(self, profile: dict):
         self.stop_event = threading.Event()
@@ -219,8 +226,8 @@ class NodeTrayApp:
 
         self.log_path = ""
         self.icon_path = ""
-        self.check_interval = 10
-        self.startup_wait = 2
+        self.check_interval = 10.0
+        self.startup_wait = 2.0
         self.socket_timeout = 1.5
         self.generated_vpn_config_path = ""
         self.node_stdout_log_path = ""
@@ -234,10 +241,17 @@ class NodeTrayApp:
         self.vpn_speed_refresh_interval = 1.0
         self.vpn_rx_rate_bps = 0.0
         self.vpn_tx_rate_bps = 0.0
-        self.vpn_rx_total_bytes = 0.0
-        self.vpn_tx_total_bytes = 0.0
+        self.vpn_rx_session_bytes = 0.0
+        self.vpn_tx_session_bytes = 0.0
         self._vpn_last_counters = None
         self._vpn_last_ts = None
+
+        self.node_restart_cooldown = 5.0
+        self.vpn_restart_cooldown = 3.0
+        self._last_node_restart_ts = 0.0
+        self._last_vpn_restart_ts = 0.0
+        self._last_node_health_failure = ""
+        self._last_vpn_health_failure = ""
 
         self.apply_profile(profile, preserve_runtime_choices=False)
 
@@ -266,10 +280,12 @@ class NodeTrayApp:
 
         self.log_path = self.resolve_path(self.app_cfg["log_path"])
         self.icon_path = self.resolve_path(self.app_cfg["icon_path"])
-        self.check_interval = self.app_cfg.get("check_interval", 10)
-        self.startup_wait = self.app_cfg.get("startup_wait", 2)
-        self.socket_timeout = self.app_cfg.get("socket_timeout", 1.5)
+        self.check_interval = float(self.app_cfg.get("check_interval", 10) or 10)
+        self.startup_wait = float(self.app_cfg.get("startup_wait", 2) or 2)
+        self.socket_timeout = float(self.app_cfg.get("socket_timeout", 1.5) or 1.5)
         self.vpn_speed_refresh_interval = float(self.app_cfg.get("vpn_speed_refresh_interval", 1.0) or 1.0)
+        self.node_restart_cooldown = float(self.app_cfg.get("node_restart_cooldown", 5.0) or 5.0)
+        self.vpn_restart_cooldown = float(self.app_cfg.get("vpn_restart_cooldown", 3.0) or 3.0)
 
         self.generated_vpn_config_path = self.resolve_path(
             self.vpn_cfg.get("generated_config_path", "generated/vpn.generated.json")
@@ -366,12 +382,11 @@ class NodeTrayApp:
         except Exception:
             return ""
 
-    def _safe_cmdline(self, proc) -> str:
+    def _safe_cmdline_list(self, proc) -> List[str]:
         try:
-            cmdline = proc.info.get("cmdline") or []
-            return " ".join(cmdline).strip()
+            return [str(x) for x in (proc.info.get("cmdline") or [])]
         except Exception:
-            return ""
+            return []
 
     def _iter_processes(self, attrs=None):
         attrs = attrs or ["pid", "name", "cmdline"]
@@ -381,8 +396,12 @@ class NodeTrayApp:
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
 
-    def _contains_flag_with_value(self, cmdline: str, flag: str, value: str) -> bool:
-        return f"{flag} {value}".lower() in cmdline.lower()
+    def _find_flag_value(self, cmdline: Sequence[str], flag: str) -> List[str]:
+        values = []
+        for i, arg in enumerate(cmdline):
+            if arg == flag and i + 1 < len(cmdline):
+                values.append(str(cmdline[i + 1]))
+        return values
 
     def find_processes(self, predicate):
         results = []
@@ -394,11 +413,36 @@ class NodeTrayApp:
                 continue
         return results
 
-    def kill_processes(self, procs, label: str):
+    def terminate_processes(self, procs, label: str, wait_timeout: float = 3.0):
         if not procs:
             self.write_log(f"No {label} processes found.")
             return
+
+        survivors = []
         for proc in procs:
+            try:
+                proc.terminate()
+                self.write_log(f"Terminate requested for {label} PID={proc.pid}")
+                survivors.append(proc)
+            except Exception as e:
+                self.write_log(f"Failed to terminate {label} PID={getattr(proc, 'pid', '?')}: {e}")
+
+        deadline = time.time() + max(wait_timeout, 0.5)
+        while survivors and time.time() < deadline:
+            remaining = []
+            for proc in survivors:
+                try:
+                    if proc.is_running():
+                        remaining.append(proc)
+                except Exception:
+                    continue
+            if not remaining:
+                self.write_log(f"All {label} processes exited gracefully.")
+                return
+            survivors = remaining
+            time.sleep(0.2)
+
+        for proc in survivors:
             try:
                 proc.kill()
                 self.write_log(f"Killed {label} PID={proc.pid}")
@@ -453,23 +497,32 @@ class NodeTrayApp:
 
     def is_node_process(self, proc) -> bool:
         name = self._safe_name(proc)
-        cmdline = self._safe_cmdline(proc).lower()
+        cmdline = self._safe_cmdline_list(proc)
 
         expected_node_exe = Path(self.resolve_path(self.node_cfg["nodejs_path"])).name.lower()
-        expected_openclaw_path = self.resolve_path(self.node_cfg["openclaw_path"]).lower()
-        expected_display_name = self.node_cfg["display_name"].lower()
-
+        expected_openclaw_path = _norm_path_text(self.resolve_path(self.node_cfg["openclaw_path"]))
+        expected_display_name = self.node_cfg["display_name"].strip().lower()
         expected_ports = {
-            str(self.node_cfg["direct_gateway_port"]).lower(),
-            str(self.node_cfg["gateway_tunnel_local_port"]).lower(),
+            str(self.node_cfg["direct_gateway_port"]),
+            str(self.node_cfg["gateway_tunnel_local_port"]),
         }
 
-        return (
-            name == expected_node_exe
-            and expected_openclaw_path in cmdline
-            and self._contains_flag_with_value(cmdline, "--display-name", expected_display_name)
-            and any(self._contains_flag_with_value(cmdline, "--port", p) for p in expected_ports)
-        )
+        if name != expected_node_exe:
+            return False
+
+        normalized_args = [_norm_path_text(x) for x in cmdline]
+        if expected_openclaw_path not in normalized_args:
+            return False
+
+        display_values = [x.strip().lower() for x in self._find_flag_value(cmdline, "--display-name")]
+        if expected_display_name not in display_values:
+            return False
+
+        port_values = {x.strip() for x in self._find_flag_value(cmdline, "--port")}
+        if not (port_values & expected_ports):
+            return False
+
+        return True
 
     def is_ssh_process(self, proc) -> bool:
         tunnel = self.node_cfg.get("ssh_tunnel")
@@ -477,21 +530,29 @@ class NodeTrayApp:
             return False
 
         name = self._safe_name(proc)
-        cmdline = self._safe_cmdline(proc).lower()
+        cmdline = self._safe_cmdline_list(proc)
+        cmd_text = " ".join(cmdline).lower()
 
         expected_forward = (
             f"{self.node_cfg['gateway_tunnel_local_port']}:127.0.0.1:{self.node_cfg['remote_port']}".lower()
         )
         expected_host = f"{tunnel['ssh_user']}@{tunnel['ssh_host']}".lower()
 
-        return name in ("ssh.exe", "ssh") and expected_forward in cmdline and expected_host in cmdline
+        return name in ("ssh.exe", "ssh") and expected_forward in cmd_text and expected_host in cmd_text
 
     def is_vpn_process(self, proc) -> bool:
         name = self._safe_name(proc)
-        cmdline = self._safe_cmdline(proc).lower()
+        cmdline = self._safe_cmdline_list(proc)
+
         exe_name = Path(self.resolve_path(self.vpn_cfg["singbox_exe"])).name.lower()
-        config_path = self.generated_vpn_config_path.lower()
-        return name == exe_name and config_path in cmdline and " run " in f" {cmdline} "
+        config_path = _norm_path_text(self.generated_vpn_config_path)
+        normalized_args = [_norm_path_text(x) for x in cmdline]
+
+        if name != exe_name:
+            return False
+        if config_path not in normalized_args:
+            return False
+        return any(str(x).strip().lower() == "run" for x in cmdline)
 
     @staticmethod
     def _normalize_keyword_text(value: str) -> str:
@@ -559,10 +620,7 @@ class NodeTrayApp:
 
         bullet_lines = [f"- `{keyword}`" for keyword in normalized]
         replacement_body = "\n".join(bullet_lines)
-        if replacement_body:
-            replacement_body += "\n\n"
-        else:
-            replacement_body = "\n"
+        replacement_body = f"{replacement_body}\n\n" if replacement_body else "\n"
 
         existing = path.read_text(encoding="utf-8") if path.exists() else ""
         pattern = re.compile(
@@ -604,7 +662,6 @@ class NodeTrayApp:
             self.write_proxy_keywords(existing)
         return added
 
-
     def _prompt_for_keyword_input_windows(self) -> Optional[str]:
         candidates = ["powershell.exe", "pwsh.exe"]
         powershell_exe = None
@@ -625,7 +682,7 @@ class NodeTrayApp:
         script = f"""
 Add-Type -AssemblyName Microsoft.VisualBasic
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$value = [Microsoft.VisualBasic.Interaction]::InputBox({title!r}, {prompt!r}, "")
+$value = [Microsoft.VisualBasic.Interaction]::InputBox({prompt!r}, {title!r}, "")
 if ($null -ne $value -and $value.Length -gt 0) {{
     [Console]::Write($value)
 }}
@@ -655,8 +712,7 @@ if ($null -ne $value -and $value.Length -gt 0) {{
             stderr = (result.stderr or "").strip()
             raise RuntimeError(stderr or f"PowerShell exited with code {result.returncode}")
 
-        value = result.stdout.replace("\ufeff", "")
-        value = value.rstrip("\r\n")
+        value = result.stdout.replace("\ufeff", "").rstrip("\r\n")
         return value or None
 
     def _prompt_for_keyword_input_tk(self) -> Optional[str]:
@@ -759,8 +815,8 @@ if ($null -ne $value -and $value.Length -gt 0) {{
             return "↓0 B/s ↑0 B/s"
         return f"↓{self._format_rate(self.vpn_rx_rate_bps)} ↑{self._format_rate(self.vpn_tx_rate_bps)}"
 
-    def vpn_total_text(self) -> str:
-        return f"↓{self._format_bytes(self.vpn_rx_total_bytes)} ↑{self._format_bytes(self.vpn_tx_total_bytes)}"
+    def vpn_session_text(self) -> str:
+        return f"↓{self._format_bytes(self.vpn_rx_session_bytes)} ↑{self._format_bytes(self.vpn_tx_session_bytes)}"
 
     def _resolve_vpn_nic_name(self) -> Optional[str]:
         target = (self.vpn_interface_name or "").strip().lower()
@@ -820,8 +876,8 @@ if ($null -ne $value -and $value.Length -gt 0) {{
             sent_delta = max(0.0, current[1] - self._vpn_last_counters[1])
             self.vpn_rx_rate_bps = recv_delta / elapsed
             self.vpn_tx_rate_bps = sent_delta / elapsed
-            self.vpn_rx_total_bytes += recv_delta
-            self.vpn_tx_total_bytes += sent_delta
+            self.vpn_rx_session_bytes += recv_delta
+            self.vpn_tx_session_bytes += sent_delta
         else:
             self.vpn_rx_rate_bps = 0.0
             self.vpn_tx_rate_bps = 0.0
@@ -830,7 +886,6 @@ if ($null -ne $value -and $value.Length -gt 0) {{
         self._vpn_last_ts = now
 
     def build_vpn_runtime_config(self, mode: Optional[str] = None) -> dict:
-
         mode = self.normalize_vpn_mode(mode or self.vpn_mode, True)
         template_path = self.resolve_path(
             self.vpn_cfg.get("config_template_path", self.vpn_cfg.get("config_path"))
@@ -839,13 +894,27 @@ if ($null -ne $value -and $value.Length -gt 0) {{
         with open(template_path, "r", encoding="utf-8") as f:
             config = json.load(f)
 
+        if not isinstance(config, dict):
+            raise ValueError("VPN config invalid: root must be an object")
+
         route = config.setdefault("route", {})
+        if not isinstance(route, dict):
+            raise ValueError("VPN config invalid: route must be an object")
+
         rules = route.get("rules", [])
+        if not isinstance(rules, list):
+            raise ValueError("VPN config invalid: route.rules must be a list")
+
+        outbounds = config.get("outbounds", [])
+        if not isinstance(outbounds, list):
+            raise ValueError("VPN config invalid: outbounds must be a list")
 
         cert_path_value = self.vpn_cfg.get("cert_path")
         if cert_path_value:
             resolved_cert_path = self.resolve_path(cert_path_value)
-            for outbound in config.get("outbounds", []):
+            for outbound in outbounds:
+                if not isinstance(outbound, dict):
+                    continue
                 tls_cfg = outbound.get("tls")
                 if isinstance(tls_cfg, dict) and tls_cfg.get("certificate_path"):
                     tls_cfg["certificate_path"] = resolved_cert_path
@@ -853,6 +922,8 @@ if ($null -ne $value -and $value.Length -gt 0) {{
         if mode == "on":
             keep_rules = []
             for rule in rules:
+                if not isinstance(rule, dict):
+                    continue
                 if rule.get("action") == "sniff":
                     keep_rules.append(rule)
                     continue
@@ -862,10 +933,15 @@ if ($null -ne $value -and $value.Length -gt 0) {{
             route["final"] = "proxy"
         else:
             keywords = self.extract_proxy_keywords()
+            updated_rules = []
             for rule in rules:
+                if not isinstance(rule, dict):
+                    updated_rules.append(rule)
+                    continue
                 if "domain_keyword" in rule:
                     rule["domain_keyword"] = keywords
-            route["rules"] = rules
+                updated_rules.append(rule)
+            route["rules"] = updated_rules
             route["final"] = "direct"
 
         return config
@@ -892,16 +968,17 @@ if ($null -ne $value -and $value.Length -gt 0) {{
         if not tunnel or not tunnel.get("enabled"):
             return
 
-        self.kill_processes(self.find_processes(self.is_ssh_process), "ssh")
-        self.write_log("Starting SSH tunnel...")
+        old_procs = self.find_processes(self.is_ssh_process)
+        self.terminate_processes(old_procs, "ssh")
+        time.sleep(0.3)
 
+        self.write_log("Starting SSH tunnel...")
         stdout_f = None
         stderr_f = None
         try:
             stdout_f, stderr_f = self._open_subprocess_logs(
                 self.ssh_stdout_log_path, self.ssh_stderr_log_path
             )
-
             subprocess.Popen(
                 [
                     tunnel.get("ssh_exe", "ssh"),
@@ -924,7 +1001,7 @@ if ($null -ne $value -and $value.Length -gt 0) {{
             if stderr_f:
                 stderr_f.close()
 
-        deadline = time.time() + max(self.startup_wait, 8)
+        deadline = time.time() + max(self.startup_wait, 8.0)
         while time.time() < deadline:
             if self.is_local_port_open(
                 "127.0.0.1",
@@ -939,11 +1016,10 @@ if ($null -ne $value -and $value.Length -gt 0) {{
 
     def start_node(self):
         gateway_url, gateway_host, gateway_port, use_tunnel = self.choose_gateway_target(log_decision=True)
-
         if use_tunnel:
             self.start_ssh_tunnel()
 
-        self.kill_processes(self.find_processes(self.is_node_process), "node")
+        self.terminate_processes(self.find_processes(self.is_node_process), "node")
         self.write_log(
             f"Starting OpenClaw node using gateway: {gateway_url} | target={gateway_host}:{gateway_port}"
         )
@@ -951,12 +1027,10 @@ if ($null -ne $value -and $value.Length -gt 0) {{
         stdout_f = None
         stderr_f = None
         proc = None
-
         try:
             stdout_f, stderr_f = self._open_subprocess_logs(
                 self.node_stdout_log_path, self.node_stderr_log_path
             )
-
             proc = subprocess.Popen(
                 [
                     self.resolve_path(self.node_cfg["nodejs_path"]),
@@ -981,7 +1055,6 @@ if ($null -ne $value -and $value.Length -gt 0) {{
                 stderr_f.close()
 
         time.sleep(self.startup_wait)
-
         if proc is not None:
             ret = proc.poll()
             if ret is not None:
@@ -995,8 +1068,8 @@ if ($null -ne $value -and $value.Length -gt 0) {{
 
     def stop_node(self):
         self.write_log("Stopping OpenClaw node and SSH tunnel...")
-        self.kill_processes(self.find_processes(self.is_node_process), "node")
-        self.kill_processes(self.find_processes(self.is_ssh_process), "ssh")
+        self.terminate_processes(self.find_processes(self.is_node_process), "node")
+        self.terminate_processes(self.find_processes(self.is_ssh_process), "ssh")
         self.node_status = False
         self.refresh_ui()
 
@@ -1005,7 +1078,7 @@ if ($null -ne $value -and $value.Length -gt 0) {{
             self.stop_vpn()
             return
 
-        self.kill_processes(self.find_processes(self.is_vpn_process), "vpn")
+        self.terminate_processes(self.find_processes(self.is_vpn_process), "vpn")
         runtime_config = self.generate_vpn_runtime_config(self.vpn_mode)
         self.write_log(f"Starting sing-box VPN with config: {runtime_config} | mode={self.vpn_mode}")
 
@@ -1015,7 +1088,6 @@ if ($null -ne $value -and $value.Length -gt 0) {{
             stdout_f, stderr_f = self._open_subprocess_logs(
                 self.vpn_stdout_log_path, self.vpn_stderr_log_path
             )
-
             subprocess.Popen(
                 [
                     self.resolve_path(self.vpn_cfg["singbox_exe"]),
@@ -1042,7 +1114,7 @@ if ($null -ne $value -and $value.Length -gt 0) {{
 
     def stop_vpn(self):
         self.write_log("Stopping sing-box VPN...")
-        self.kill_processes(self.find_processes(self.is_vpn_process), "vpn")
+        self.terminate_processes(self.find_processes(self.is_vpn_process), "vpn")
         self.vpn_status = False
         self.update_vpn_speed(reset=True)
         self.refresh_ui()
@@ -1064,19 +1136,64 @@ if ($null -ne $value -and $value.Length -gt 0) {{
     def check_node_status(self) -> bool:
         node_procs = self.find_processes(self.is_node_process)
         if not node_procs:
+            self._last_node_health_failure = "node process not found"
             return False
 
-        if len(self.find_processes(self.is_ssh_process)) > 0:
-            return self.is_local_port_open(
+        _, gateway_host, gateway_port, use_tunnel = self.choose_gateway_target(log_decision=False)
+        if use_tunnel:
+            ssh_ok = len(self.find_processes(self.is_ssh_process)) > 0 and self.is_local_port_open(
                 "127.0.0.1",
                 int(self.node_cfg["gateway_tunnel_local_port"]),
                 self.socket_timeout,
             )
+            if not ssh_ok:
+                self._last_node_health_failure = "ssh tunnel unavailable"
+                return False
 
+        if not self.is_local_port_open(gateway_host, int(gateway_port), self.socket_timeout):
+            self._last_node_health_failure = f"gateway target not reachable: {gateway_host}:{gateway_port}"
+            return False
+
+        self._last_node_health_failure = ""
         return True
 
+    def _vpn_health_targets(self) -> List[Tuple[str, int]]:
+        targets = []
+        configured = self.vpn_cfg.get("health_check_targets") or self.app_cfg.get("vpn_health_check_targets") or []
+        for item in configured:
+            try:
+                if isinstance(item, str):
+                    host, port = item.rsplit(":", 1)
+                    targets.append((host.strip(), int(port)))
+                elif isinstance(item, dict):
+                    host = str(item.get("host", "")).strip()
+                    port = int(item.get("port", 0))
+                    if host and port > 0:
+                        targets.append((host, port))
+            except Exception:
+                continue
+        if not targets:
+            targets = [("1.1.1.1", 53), ("8.8.8.8", 53)]
+        return targets
+
     def check_vpn_status(self) -> bool:
-        return len(self.find_processes(self.is_vpn_process)) > 0
+        vpn_procs = self.find_processes(self.is_vpn_process)
+        if not vpn_procs:
+            self._last_vpn_health_failure = "vpn process not found"
+            return False
+
+        nic_name = self._resolve_vpn_nic_name()
+        if not nic_name:
+            self._last_vpn_health_failure = f"vpn interface not found: {self.vpn_interface_name}"
+            return False
+
+        for host, port in self._vpn_health_targets():
+            if self.is_local_port_open(host, port, self.socket_timeout):
+                self._last_vpn_health_failure = ""
+                return True
+
+        self._last_vpn_health_failure = "vpn connectivity check failed"
+        return False
 
     def load_base_icon(self) -> Image.Image:
         try:
@@ -1115,20 +1232,20 @@ if ($null -ne $value -and $value.Length -gt 0) {{
         return base
 
     def refresh_ui(self):
-        if self.tray_icon is None:
+        if self.tray_icon is None or self.shutting_down:
             return
 
         try:
             self.tray_icon.icon = self.make_status_icon()
             speed_text = self.vpn_speed_text() if self.vpn_mode != "off" else "↓0 B/s ↑0 B/s"
-            total_text = self.vpn_total_text()
+            session_text = self.vpn_session_text()
             self.tray_icon.title = (
                 f"{self.profile['profile_name']} | "
                 f"node={'ON' if self.node_status else 'OFF'} | "
                 f"vpn={self.vpn_mode.upper()} ({'UP' if self.vpn_status else 'DOWN'}) | "
-                f"{speed_text} | Total {total_text}"
+                f"{speed_text} | Session {session_text}"
             )
-            if self.tray_ready.is_set() and not self.shutting_down:
+            if self.tray_ready.is_set():
                 self.tray_icon.visible = True
                 self.tray_icon.update_menu()
         except Exception as e:
@@ -1222,14 +1339,46 @@ if ($null -ne $value -and $value.Length -gt 0) {{
         self.shutting_down = True
         self.stop_event.set()
         with self.state_lock:
-            self.stop_vpn()
-            self.stop_node()
+            self.write_log("Stopping services for exit...")
+            self.terminate_processes(self.find_processes(self.is_vpn_process), "vpn")
+            self.terminate_processes(self.find_processes(self.is_node_process), "node")
+            self.terminate_processes(self.find_processes(self.is_ssh_process), "ssh")
+            self.vpn_status = False
+            self.node_status = False
+            self.update_vpn_speed(reset=True)
         if icon:
             try:
                 icon.visible = False
             except Exception:
                 pass
             icon.stop()
+
+    def _should_restart_node(self) -> bool:
+        if not self.node_desired or self.shutting_down:
+            return False
+        if self.node_status:
+            return False
+        return (time.time() - self._last_node_restart_ts) >= self.node_restart_cooldown
+
+    def _should_restart_vpn(self) -> bool:
+        if self.vpn_mode == "off" or self.shutting_down:
+            return False
+        if self.vpn_status:
+            return False
+        return (time.time() - self._last_vpn_restart_ts) >= self.vpn_restart_cooldown
+
+    def _recover_node_locked(self):
+        self._last_node_restart_ts = time.time()
+        self.write_log(f"Node unhealthy; restarting. Reason: {self._last_node_health_failure or 'unknown'}")
+        self.stop_node()
+        self.start_node()
+
+    def _recover_vpn_locked(self):
+        self._last_vpn_restart_ts = time.time()
+        self.write_log(f"VPN unhealthy; reconnecting. Reason: {self._last_vpn_health_failure or 'unknown'}")
+        self.stop_vpn()
+        if self.vpn_mode != "off":
+            self.start_vpn()
 
     def monitor_loop(self):
         self.write_log("Monitor thread started.")
@@ -1241,8 +1390,17 @@ if ($null -ne $value -and $value.Length -gt 0) {{
                     now = time.time()
                     if now - last_status_check >= float(self.check_interval):
                         self.node_status = self.check_node_status()
-                        self.vpn_status = self.check_vpn_status()
+                        self.vpn_status = self.check_vpn_status() if self.vpn_mode != "off" else False
                         last_status_check = now
+
+                        if self._should_restart_node():
+                            self._recover_node_locked()
+                            self.node_status = self.check_node_status()
+
+                        if self._should_restart_vpn():
+                            self._recover_vpn_locked()
+                            self.vpn_status = self.check_vpn_status() if self.vpn_mode != "off" else False
+
                     self.update_vpn_speed(reset=not self.vpn_status)
                     if not self.shutting_down:
                         self.refresh_ui()
@@ -1267,12 +1425,11 @@ if ($null -ne $value -and $value.Length -gt 0) {{
         with self.state_lock:
             if self.node_desired:
                 self.start_node()
-
             if self.vpn_mode != "off":
                 self.start_vpn()
 
             self.node_status = self.check_node_status()
-            self.vpn_status = self.check_vpn_status()
+            self.vpn_status = self.check_vpn_status() if self.vpn_mode != "off" else False
             self.refresh_ui()
 
     def run(self):
@@ -1287,7 +1444,7 @@ if ($null -ne $value -and $value.Length -gt 0) {{
                 item("Node OFF", self.node_off_menu, checked=lambda _: not self.node_desired, radio=True),
                 pystray.Menu.SEPARATOR,
                 item(lambda _: f"VPN Speed {self.vpn_speed_text()}", self.noop, enabled=False),
-                item(lambda _: f"VPN Total {self.vpn_total_text()}", self.noop, enabled=False),
+                item(lambda _: f"VPN Session {self.vpn_session_text()}", self.noop, enabled=False),
                 item("VPN ON", self.vpn_on_menu, checked=lambda _: self.vpn_mode == "on", radio=True),
                 item("VPN AUTO", self.vpn_auto_menu, checked=lambda _: self.vpn_mode == "auto", radio=True),
                 item("VPN OFF", self.vpn_off_menu, checked=lambda _: self.vpn_mode == "off", radio=True),
