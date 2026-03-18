@@ -14,16 +14,11 @@
 - `anthropic`
 - `github`
 - `discord`
+- `chatgpt`
+- `x`
 
 ## How to extend
-一行一个关键词，继续按下面这种 bullet 形式追加就行：
-
-- `x`
-- `twitter`
-- `telegram`
-- `discord`
-- `notion`
-- `claude`
+一行一个关键词，继续按 bullet 形式追加就行
 
 ## Rule of thumb
 优先写稳定、辨识度高、不会误伤国内站点的关键词。
