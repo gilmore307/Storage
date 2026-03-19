@@ -16,6 +16,10 @@
 - `discord`
 - `chatgpt`
 - `x`
+- `firstrade`
+- `steampowered`
+- `docker`
+- `openclaw`
 
 ## How to extend
 一行一个关键词，继续按 bullet 形式追加就行

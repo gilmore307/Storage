@@ -9,9 +9,10 @@ import sys
 import threading
 import time
 import traceback
+import webbrowser
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
     import psutil
@@ -212,12 +213,12 @@ class NodeTrayApp:
         self.tray_ready = threading.Event()
         self.shutting_down = False
 
-        self.profile = {}
-        self.profile_path = None
-        self.profile_dir = None
-        self.node_cfg = {}
-        self.vpn_cfg = {}
-        self.app_cfg = {}
+        self.profile: Dict[str, Any] = {}
+        self.profile_path: Optional[Path] = None
+        self.profile_dir: Optional[Path] = None
+        self.node_cfg: Dict[str, Any] = {}
+        self.vpn_cfg: Dict[str, Any] = {}
+        self.app_cfg: Dict[str, Any] = {}
 
         self.node_desired = True
         self.vpn_mode = "off"
@@ -243,8 +244,8 @@ class NodeTrayApp:
         self.vpn_tx_rate_bps = 0.0
         self.vpn_rx_session_bytes = 0.0
         self.vpn_tx_session_bytes = 0.0
-        self._vpn_last_counters = None
-        self._vpn_last_ts = None
+        self._vpn_last_counters: Optional[Any] = None
+        self._vpn_last_ts: Optional[float] = None
 
         self.node_restart_cooldown = 5.0
         self.vpn_restart_cooldown = 3.0
@@ -252,6 +253,21 @@ class NodeTrayApp:
         self._last_vpn_restart_ts = 0.0
         self._last_node_health_failure = ""
         self._last_vpn_health_failure = ""
+        self.node_health_fail_count = 0
+        self.node_health_fail_threshold = 3
+        self.node_health_grace_after_vpn_start = 20.0
+        self.node_health_grace_after_node_start = 15.0
+        self.vpn_health_fail_count = 0
+        self.vpn_health_fail_threshold = 3
+        self.vpn_health_grace_after_vpn_start = 20.0
+        self._last_vpn_started_ts = 0.0
+        self._last_node_started_ts = 0.0
+        self._last_node_health_probe_error = ""
+
+        self.active_gateway_url: Optional[str] = None
+        self.active_gateway_host: Optional[str] = None
+        self.active_gateway_port: Optional[int] = None
+        self.active_use_tunnel = False
 
         self.apply_profile(profile, preserve_runtime_choices=False)
 
@@ -286,6 +302,17 @@ class NodeTrayApp:
         self.vpn_speed_refresh_interval = float(self.app_cfg.get("vpn_speed_refresh_interval", 1.0) or 1.0)
         self.node_restart_cooldown = float(self.app_cfg.get("node_restart_cooldown", 5.0) or 5.0)
         self.vpn_restart_cooldown = float(self.app_cfg.get("vpn_restart_cooldown", 3.0) or 3.0)
+        self.node_health_fail_threshold = max(1, int(self.app_cfg.get("node_health_fail_threshold", 3) or 3))
+        self.node_health_grace_after_vpn_start = float(
+            self.app_cfg.get("node_health_grace_after_vpn_start", 20.0) or 20.0
+        )
+        self.node_health_grace_after_node_start = float(
+            self.app_cfg.get("node_health_grace_after_node_start", 15.0) or 15.0
+        )
+        self.vpn_health_fail_threshold = max(1, int(self.app_cfg.get("vpn_health_fail_threshold", 3) or 3))
+        self.vpn_health_grace_after_vpn_start = float(
+            self.app_cfg.get("vpn_health_grace_after_vpn_start", 20.0) or 20.0
+        )
 
         self.generated_vpn_config_path = self.resolve_path(
             self.vpn_cfg.get("generated_config_path", "generated/vpn.generated.json")
@@ -357,7 +384,8 @@ class NodeTrayApp:
         p = Path(path_value)
         if p.is_absolute():
             return str(p)
-        return str((self.profile_dir / p).resolve())
+        base_dir = self.profile_dir or Path.cwd()
+        return str((base_dir / p).resolve())
 
     def ensure_log_dir(self):
         Path(self.log_path).parent.mkdir(parents=True, exist_ok=True)
@@ -488,6 +516,52 @@ class NodeTrayApp:
         env["OPENCLAW_GATEWAY_URL"] = gateway_url
         return env
 
+    def _set_active_gateway_target(self, gateway_url: str, gateway_host: str, gateway_port: int, use_tunnel: bool):
+        self.active_gateway_url = str(gateway_url)
+        self.active_gateway_host = str(gateway_host)
+        self.active_gateway_port = int(gateway_port)
+        self.active_use_tunnel = bool(use_tunnel)
+
+    def _clear_active_gateway_target(self):
+        self.active_gateway_url: Optional[str] = None
+        self.active_gateway_host: Optional[str] = None
+        self.active_gateway_port: Optional[int] = None
+        self.active_use_tunnel = False
+
+    def _ssh_remote_forward_target(self) -> Tuple[str, int]:
+        tunnel = self.node_cfg.get("ssh_tunnel") or {}
+        remote_host = str(
+            tunnel.get("remote_forward_host")
+            or self.node_cfg.get("direct_gateway_host")
+            or "127.0.0.1"
+        ).strip()
+
+        remote_port_value = (
+            tunnel.get("remote_forward_port")
+            or self.node_cfg.get("direct_gateway_port")
+            or self.node_cfg.get("remote_port")
+            or self.node_cfg.get("gateway_tunnel_local_port")
+        )
+        if remote_port_value is None:
+            raise ValueError("SSH tunnel remote forward port is not configured")
+        remote_port = int(remote_port_value)
+        return remote_host, remote_port
+
+    def _dashboard_local_url(self) -> str:
+        local_port = int(self.node_cfg["gateway_tunnel_local_port"])
+        token = str(self.node_cfg.get("gateway_token", "")).strip()
+        if token:
+            return f"http://127.0.0.1:{local_port}/#token={token}"
+        return f"http://127.0.0.1:{local_port}/"
+
+    def is_ssh_tunnel_ready(self) -> bool:
+        local_port = int(self.node_cfg["gateway_tunnel_local_port"])
+        return bool(self.find_processes(self.is_ssh_process)) and self.is_local_port_open(
+            "127.0.0.1",
+            local_port,
+            self.socket_timeout,
+        )
+
     def _open_subprocess_logs(self, stdout_path: str, stderr_path: str):
         self.ensure_parent_dir(stdout_path)
         self.ensure_parent_dir(stderr_path)
@@ -533,8 +607,9 @@ class NodeTrayApp:
         cmdline = self._safe_cmdline_list(proc)
         cmd_text = " ".join(cmdline).lower()
 
+        forward_host, forward_port = self._ssh_remote_forward_target()
         expected_forward = (
-            f"{self.node_cfg['gateway_tunnel_local_port']}:127.0.0.1:{self.node_cfg['remote_port']}".lower()
+            f"{self.node_cfg['gateway_tunnel_local_port']}:{forward_host}:{forward_port}".lower()
         )
         expected_host = f"{tunnel['ssh_user']}@{tunnel['ssh_host']}".lower()
 
@@ -721,7 +796,7 @@ if ($null -ne $value -and $value.Length -gt 0) {{
         except Exception as exc:
             raise RuntimeError(f"tkinter unavailable: {exc}") from exc
 
-        result = {"value": None}
+        result: Dict[str, Optional[str]] = {"value": None}
         root = tk.Tk()
         root.title(f"{self.profile['profile_name']} - Add Keyword")
         root.resizable(False, False)
@@ -887,9 +962,10 @@ if ($null -ne $value -and $value.Length -gt 0) {{
 
     def build_vpn_runtime_config(self, mode: Optional[str] = None) -> dict:
         mode = self.normalize_vpn_mode(mode or self.vpn_mode, True)
-        template_path = self.resolve_path(
-            self.vpn_cfg.get("config_template_path", self.vpn_cfg.get("config_path"))
-        )
+        template_path_value = self.vpn_cfg.get("config_template_path") or self.vpn_cfg.get("config_path")
+        if not template_path_value:
+            raise ValueError("VPN config template path is not configured")
+        template_path = self.resolve_path(str(template_path_value))
 
         with open(template_path, "r", encoding="utf-8") as f:
             config = json.load(f)
@@ -972,7 +1048,11 @@ if ($null -ne $value -and $value.Length -gt 0) {{
         self.terminate_processes(old_procs, "ssh")
         time.sleep(0.3)
 
-        self.write_log("Starting SSH tunnel...")
+        forward_host, forward_port = self._ssh_remote_forward_target()
+        self.write_log(
+            "Starting SSH tunnel... "
+            f"local=127.0.0.1:{self.node_cfg['gateway_tunnel_local_port']} -> remote={forward_host}:{forward_port}"
+        )
         stdout_f = None
         stderr_f = None
         try:
@@ -986,7 +1066,7 @@ if ($null -ne $value -and $value.Length -gt 0) {{
                     "-o", "ExitOnForwardFailure=yes",
                     "-o", "ServerAliveInterval=30",
                     "-o", "ServerAliveCountMax=3",
-                    "-L", f"{self.node_cfg['gateway_tunnel_local_port']}:127.0.0.1:{self.node_cfg['remote_port']}",
+                    "-L", f"{self.node_cfg['gateway_tunnel_local_port']}:{forward_host}:{forward_port}",
                     f"{tunnel['ssh_user']}@{tunnel['ssh_host']}",
                 ],
                 stdin=subprocess.DEVNULL,
@@ -1003,11 +1083,7 @@ if ($null -ne $value -and $value.Length -gt 0) {{
 
         deadline = time.time() + max(self.startup_wait, 8.0)
         while time.time() < deadline:
-            if self.is_local_port_open(
-                "127.0.0.1",
-                int(self.node_cfg["gateway_tunnel_local_port"]),
-                self.socket_timeout,
-            ):
+            if self.is_ssh_tunnel_ready():
                 self.write_log("SSH tunnel local port is ready.")
                 return
             time.sleep(0.5)
@@ -1016,6 +1092,7 @@ if ($null -ne $value -and $value.Length -gt 0) {{
 
     def start_node(self):
         gateway_url, gateway_host, gateway_port, use_tunnel = self.choose_gateway_target(log_decision=True)
+        self._set_active_gateway_target(gateway_url, gateway_host, gateway_port, use_tunnel)
         if use_tunnel:
             self.start_ssh_tunnel()
 
@@ -1023,6 +1100,8 @@ if ($null -ne $value -and $value.Length -gt 0) {{
         self.write_log(
             f"Starting OpenClaw node using gateway: {gateway_url} | target={gateway_host}:{gateway_port}"
         )
+        self._last_node_started_ts = time.time()
+        self._reset_node_health_probe_state()
 
         stdout_f = None
         stderr_f = None
@@ -1067,9 +1146,12 @@ if ($null -ne $value -and $value.Length -gt 0) {{
         self.refresh_ui()
 
     def stop_node(self):
-        self.write_log("Stopping OpenClaw node and SSH tunnel...")
+        stop_tunnel = bool(self.active_use_tunnel)
+        self.write_log("Stopping OpenClaw node and SSH tunnel..." if stop_tunnel else "Stopping OpenClaw node...")
         self.terminate_processes(self.find_processes(self.is_node_process), "node")
-        self.terminate_processes(self.find_processes(self.is_ssh_process), "ssh")
+        if stop_tunnel:
+            self.terminate_processes(self.find_processes(self.is_ssh_process), "ssh")
+        self._clear_active_gateway_target()
         self.node_status = False
         self.refresh_ui()
 
@@ -1107,6 +1189,8 @@ if ($null -ne $value -and $value.Length -gt 0) {{
             if stderr_f:
                 stderr_f.close()
 
+        self._last_vpn_started_ts = time.time()
+        self.vpn_health_fail_count = 0
         time.sleep(self.startup_wait)
         self.vpn_status = self.check_vpn_status()
         self.update_vpn_speed(reset=not self.vpn_status)
@@ -1133,27 +1217,66 @@ if ($null -ne $value -and $value.Length -gt 0) {{
         if icon:
             icon.notify(message, self.profile["profile_name"])
 
+    def _reset_node_health_probe_state(self):
+        self.node_health_fail_count = 0
+        self._last_node_health_probe_error = ""
+
+    def _node_health_in_grace_period(self) -> bool:
+        now = time.time()
+        if self._last_node_started_ts and (now - self._last_node_started_ts) < self.node_health_grace_after_node_start:
+            return True
+        if self._last_vpn_started_ts and (now - self._last_vpn_started_ts) < self.node_health_grace_after_vpn_start:
+            return True
+        return False
+
+    def _handle_node_connectivity_probe_failure(self, reason: str) -> bool:
+        self._last_node_health_probe_error = reason
+        self.node_health_fail_count += 1
+
+        if self._node_health_in_grace_period():
+            self._last_node_health_failure = ""
+            self.write_log(
+                f"Node gateway probe failed during grace period; keeping node alive. "
+                f"reason={reason} | fail_count={self.node_health_fail_count}/{self.node_health_fail_threshold}"
+            )
+            return True
+
+        if self.node_health_fail_count < self.node_health_fail_threshold:
+            self._last_node_health_failure = ""
+            self.write_log(
+                f"Node gateway probe failed; waiting for consecutive threshold before restart. "
+                f"reason={reason} | fail_count={self.node_health_fail_count}/{self.node_health_fail_threshold}"
+            )
+            return True
+
+        self._last_node_health_failure = reason
+        return False
+
     def check_node_status(self) -> bool:
         node_procs = self.find_processes(self.is_node_process)
         if not node_procs:
+            self._reset_node_health_probe_state()
             self._last_node_health_failure = "node process not found"
             return False
 
-        _, gateway_host, gateway_port, use_tunnel = self.choose_gateway_target(log_decision=False)
+        gateway_host = self.active_gateway_host
+        gateway_port = self.active_gateway_port
+        use_tunnel = bool(self.active_use_tunnel)
+
+        if not gateway_host or not gateway_port:
+            gateway_url, gateway_host, gateway_port, use_tunnel = self.choose_gateway_target(log_decision=False)
+            self._set_active_gateway_target(gateway_url, gateway_host, gateway_port, use_tunnel)
+
         if use_tunnel:
-            ssh_ok = len(self.find_processes(self.is_ssh_process)) > 0 and self.is_local_port_open(
-                "127.0.0.1",
-                int(self.node_cfg["gateway_tunnel_local_port"]),
-                self.socket_timeout,
+            if not self.is_ssh_tunnel_ready():
+                return self._handle_node_connectivity_probe_failure("ssh tunnel unavailable")
+
+        if not self.is_local_port_open(str(gateway_host), int(gateway_port), self.socket_timeout):
+            return self._handle_node_connectivity_probe_failure(
+                f"gateway target not reachable: {gateway_host}:{gateway_port}"
             )
-            if not ssh_ok:
-                self._last_node_health_failure = "ssh tunnel unavailable"
-                return False
 
-        if not self.is_local_port_open(gateway_host, int(gateway_port), self.socket_timeout):
-            self._last_node_health_failure = f"gateway target not reachable: {gateway_host}:{gateway_port}"
-            return False
-
+        self._reset_node_health_probe_state()
         self._last_node_health_failure = ""
         return True
 
@@ -1180,19 +1303,41 @@ if ($null -ne $value -and $value.Length -gt 0) {{
         vpn_procs = self.find_processes(self.is_vpn_process)
         if not vpn_procs:
             self._last_vpn_health_failure = "vpn process not found"
+            self.vpn_health_fail_count = 0
             return False
 
         nic_name = self._resolve_vpn_nic_name()
         if not nic_name:
             self._last_vpn_health_failure = f"vpn interface not found: {self.vpn_interface_name}"
+            self.vpn_health_fail_count = 0
             return False
 
         for host, port in self._vpn_health_targets():
             if self.is_local_port_open(host, port, self.socket_timeout):
                 self._last_vpn_health_failure = ""
+                self.vpn_health_fail_count = 0
                 return True
 
-        self._last_vpn_health_failure = "vpn connectivity check failed"
+        reason = "vpn connectivity check failed"
+        self._last_vpn_health_failure = reason
+        self.vpn_health_fail_count += 1
+        now = time.time()
+
+        if self._last_vpn_started_ts and (now - self._last_vpn_started_ts) < self.vpn_health_grace_after_vpn_start:
+            self.write_log(
+                "VPN connectivity probe failed during grace period; keeping vpn alive. "
+                f"reason={reason} | fail_count={self.vpn_health_fail_count}/{self.vpn_health_fail_threshold}"
+            )
+            return True
+
+        if self.vpn_health_fail_count < self.vpn_health_fail_threshold:
+            self.write_log(
+                "VPN connectivity probe failed; waiting for consecutive threshold before reconnect. "
+                f"reason={reason} | fail_count={self.vpn_health_fail_count}/{self.vpn_health_fail_threshold}"
+            )
+            return True
+
+        self._last_vpn_health_failure = f"{reason} (consecutive_failures={self.vpn_health_fail_count})"
         return False
 
     def load_base_icon(self) -> Image.Image:
@@ -1334,6 +1479,39 @@ if ($null -ne $value -and $value.Length -gt 0) {{
             if icon:
                 icon.notify(f"Add Keyword failed: {e}", self.profile["profile_name"])
 
+    def open_dashboard_menu(self, icon=None, menu_item=None):
+        try:
+            with self.state_lock:
+                tunnel = self.node_cfg.get("ssh_tunnel")
+                if not tunnel or not tunnel.get("enabled"):
+                    message = "Dashboard tunnel is not configured"
+                    self.write_log(message)
+                    if icon:
+                        icon.notify(message, self.profile["profile_name"])
+                    return
+
+                if not self.is_ssh_tunnel_ready():
+                    self.start_ssh_tunnel()
+
+                if not self.is_ssh_tunnel_ready():
+                    message = "Dashboard tunnel failed to start"
+                    self.write_log(message)
+                    if icon:
+                        icon.notify(message, self.profile["profile_name"])
+                    return
+
+                dashboard_url = self._dashboard_local_url()
+                opened = webbrowser.open(dashboard_url, new=1, autoraise=True)
+                self.write_log(
+                    f"Opening dashboard via localhost: {dashboard_url} | browser_opened={'yes' if opened else 'no'}"
+                )
+                if icon:
+                    icon.notify("Dashboard opened via localhost", self.profile["profile_name"])
+        except Exception as e:
+            self.write_exception("open_dashboard_menu error", e)
+            if icon:
+                icon.notify(f"Open Dashboard failed: {e}", self.profile["profile_name"])
+
     def on_exit(self, icon=None, menu_item=None):
         self.write_log("Exit requested.")
         self.shutting_down = True
@@ -1440,6 +1618,8 @@ if ($null -ne $value -and $value.Length -gt 0) {{
             self.make_status_icon(),
             self.profile["profile_name"],
             menu=pystray.Menu(
+                item("Open Dashboard", self.open_dashboard_menu),
+                pystray.Menu.SEPARATOR,
                 item("Node ON", self.node_on_menu, checked=lambda _: self.node_desired, radio=True),
                 item("Node OFF", self.node_off_menu, checked=lambda _: not self.node_desired, radio=True),
                 pystray.Menu.SEPARATOR,

@@ -8,7 +8,12 @@
     "check_interval": 10,
     "startup_wait": 2,
     "socket_timeout": 1.5,
-    "auto_start_vpn_mode": "auto"
+    "auto_start_vpn_mode": "auto",
+    "node_health_fail_threshold": 3,
+    "node_health_grace_after_vpn_start": 20,
+    "node_health_grace_after_node_start": 15,
+    "vpn_health_fail_threshold": 3,
+    "vpn_health_grace_after_vpn_start": 20
   },
   "openclaw": {
     "display_name": "node-1-office",
@@ -22,12 +27,14 @@
     "direct_gateway_port": 18789,
     "direct_gateway_url": "ws://100.110.207.125:18789/",
     "tunnel_gateway_url": "ws://127.0.0.1:18789/",
-    "ssh_tunnel": {
-      "enabled": true,
-      "ssh_exe": "ssh",
-      "ssh_user": "root",
-      "ssh_host": "100.110.207.125"
-    },
+  "ssh_tunnel": {
+    "enabled": true,
+    "ssh_exe": "ssh",
+    "ssh_user": "root",
+    "ssh_host": "100.110.207.125",
+    "remote_forward_host": "100.110.207.125",
+    "remote_forward_port": 18789
+  },
     "node_port": 18790,
     "gateway_tunnel_local_port": 18789
   },
