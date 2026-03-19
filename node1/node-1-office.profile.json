@@ -13,7 +13,7 @@
   "openclaw": {
     "display_name": "node-1-office",
     "gateway_token": "40ec3c89f1cfda3e2db02edc54d0682759968b02575d771b",
-    "nodejs_path": "C:/Program Files/nodejs/node.exe",
+    "nodejs_path": "D:/Program Files/nodejs/node.exe",
     "openclaw_path": "C:/Users/sunch/AppData/Roaming/npm/node_modules/openclaw/dist/index.js",
     "bind_host": "127.0.0.1",
     "remote_port": 18789,
