@@ -269,6 +269,10 @@ class NodeTrayApp:
         self.active_gateway_port: Optional[int] = None
         self.active_use_tunnel = False
 
+        self.log_root_dir = ""
+        self.session_dir = ""
+        self.session_generated_dir = ""
+
         self.apply_profile(profile, preserve_runtime_choices=False)
 
     @staticmethod
@@ -294,8 +298,9 @@ class NodeTrayApp:
         self.vpn_cfg = profile["vpn"]
         self.app_cfg = profile.get("app", {})
 
-        self.log_path = self.resolve_path(self.app_cfg["log_path"])
         self.icon_path = self.resolve_path(self.app_cfg["icon_path"])
+        self._ensure_runtime_session_paths()
+
         self.check_interval = float(self.app_cfg.get("check_interval", 10) or 10)
         self.startup_wait = float(self.app_cfg.get("startup_wait", 2) or 2)
         self.socket_timeout = float(self.app_cfg.get("socket_timeout", 1.5) or 1.5)
@@ -314,26 +319,33 @@ class NodeTrayApp:
             self.app_cfg.get("vpn_health_grace_after_vpn_start", 20.0) or 20.0
         )
 
-        self.generated_vpn_config_path = self.resolve_path(
-            self.vpn_cfg.get("generated_config_path", "generated/vpn.generated.json")
+        self.generated_vpn_config_path = self.resolve_generated_session_path(
+            self.vpn_cfg.get("generated_config_path", "generated/vpn.generated.json"),
+            default_name="vpn.generated.json",
         )
-        self.node_stdout_log_path = self.resolve_path(
-            self.app_cfg.get("node_stdout_log_path", "generated/node.stdout.log")
+        self.node_stdout_log_path = self.resolve_log_session_path(
+            self.app_cfg.get("node_stdout_log_path", "generated/node.stdout.log"),
+            default_name="node.stdout.log",
         )
-        self.node_stderr_log_path = self.resolve_path(
-            self.app_cfg.get("node_stderr_log_path", "generated/node.stderr.log")
+        self.node_stderr_log_path = self.resolve_log_session_path(
+            self.app_cfg.get("node_stderr_log_path", "generated/node.stderr.log"),
+            default_name="node.stderr.log",
         )
-        self.ssh_stdout_log_path = self.resolve_path(
-            self.app_cfg.get("ssh_stdout_log_path", "generated/ssh.stdout.log")
+        self.ssh_stdout_log_path = self.resolve_log_session_path(
+            self.app_cfg.get("ssh_stdout_log_path", "generated/ssh.stdout.log"),
+            default_name="ssh.stdout.log",
         )
-        self.ssh_stderr_log_path = self.resolve_path(
-            self.app_cfg.get("ssh_stderr_log_path", "generated/ssh.stderr.log")
+        self.ssh_stderr_log_path = self.resolve_log_session_path(
+            self.app_cfg.get("ssh_stderr_log_path", "generated/ssh.stderr.log"),
+            default_name="ssh.stderr.log",
         )
-        self.vpn_stdout_log_path = self.resolve_path(
-            self.app_cfg.get("vpn_stdout_log_path", "generated/vpn.stdout.log")
+        self.vpn_stdout_log_path = self.resolve_log_session_path(
+            self.app_cfg.get("vpn_stdout_log_path", "generated/vpn.stdout.log"),
+            default_name="vpn.stdout.log",
         )
-        self.vpn_stderr_log_path = self.resolve_path(
-            self.app_cfg.get("vpn_stderr_log_path", "generated/vpn.stderr.log")
+        self.vpn_stderr_log_path = self.resolve_log_session_path(
+            self.app_cfg.get("vpn_stderr_log_path", "generated/vpn.stderr.log"),
+            default_name="vpn.stderr.log",
         )
 
         self.vpn_interface_name = self.detect_vpn_interface_name()
@@ -386,6 +398,87 @@ class NodeTrayApp:
             return str(p)
         base_dir = self.profile_dir or Path.cwd()
         return str((base_dir / p).resolve())
+
+    @staticmethod
+    def _sanitize_session_component(value: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "").strip())
+        cleaned = cleaned.strip(".-")
+        return cleaned or "session"
+
+    @staticmethod
+    def _trim_runtime_prefix(path_value: str, prefixes: Sequence[str], default_name: str) -> Path:
+        raw = str(path_value or "").strip()
+        if not raw:
+            return Path(default_name)
+
+        path = Path(raw)
+        if path.is_absolute():
+            return Path(path.name or default_name)
+
+        parts = list(path.parts)
+        lowered_prefixes = {str(prefix).strip().lower() for prefix in prefixes}
+        while parts and parts[0].strip().lower() in lowered_prefixes:
+            parts = parts[1:]
+
+        if not parts:
+            return Path(default_name)
+
+        return Path(*parts)
+
+    def _default_log_root_dir(self) -> str:
+        configured_root = str(self.app_cfg.get("log_root_dir", "") or "").strip()
+        if configured_root:
+            return configured_root
+
+        log_path_value = str(self.app_cfg.get("log_path", "logs/tray.log") or "").strip()
+        parent = Path(log_path_value).parent
+        if not str(parent) or str(parent) == ".":
+            return "logs"
+        return str(parent)
+
+    def _create_session_dir(self, root_dir: Path) -> Path:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        profile_name = self._sanitize_session_component(self.profile.get("profile_name", "openclaw"))
+        pid = os.getpid()
+        base_name = f"{timestamp}-{profile_name}-pid{pid}"
+        session_dir = root_dir / base_name
+        suffix = 1
+        while session_dir.exists():
+            suffix += 1
+            session_dir = root_dir / f"{base_name}-{suffix}"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        return session_dir
+
+    def _ensure_runtime_session_paths(self):
+        log_root_dir = Path(self.resolve_path(self._default_log_root_dir()))
+        log_root_dir.mkdir(parents=True, exist_ok=True)
+        self.log_root_dir = str(log_root_dir)
+
+        if not self.session_dir:
+            session_dir = self._create_session_dir(log_root_dir)
+            self.session_dir = str(session_dir)
+            self.session_generated_dir = str((session_dir / "generated").resolve())
+        else:
+            session_dir = Path(self.session_dir)
+            session_dir.mkdir(parents=True, exist_ok=True)
+            if not self.session_generated_dir:
+                self.session_generated_dir = str((session_dir / "generated").resolve())
+
+        Path(self.session_generated_dir).mkdir(parents=True, exist_ok=True)
+        self.log_path = self.resolve_log_session_path(
+            self.app_cfg.get("log_path", "logs/tray.log"),
+            default_name="tray.log",
+        )
+
+    def resolve_log_session_path(self, path_value: str, default_name: str) -> str:
+        rel_path = self._trim_runtime_prefix(path_value, prefixes=("logs", "generated"), default_name=default_name)
+        target = Path(self.session_dir) / rel_path
+        return str(target.resolve())
+
+    def resolve_generated_session_path(self, path_value: str, default_name: str) -> str:
+        rel_path = self._trim_runtime_prefix(path_value, prefixes=("generated", "logs"), default_name=default_name)
+        target = Path(self.session_generated_dir) / rel_path
+        return str(target.resolve())
 
     def ensure_log_dir(self):
         Path(self.log_path).parent.mkdir(parents=True, exist_ok=True)
@@ -977,9 +1070,19 @@ if ($null -ne $value -and $value.Length -gt 0) {{
         if not isinstance(route, dict):
             raise ValueError("VPN config invalid: route must be an object")
 
+        dns = config.setdefault("dns", {})
+        if not isinstance(dns, dict):
+            raise ValueError("VPN config invalid: dns must be an object")
+
         rules = route.get("rules", [])
         if not isinstance(rules, list):
             raise ValueError("VPN config invalid: route.rules must be a list")
+
+        dns_rules = dns.get("rules", [])
+        if dns_rules is None:
+            dns_rules = []
+        if not isinstance(dns_rules, list):
+            raise ValueError("VPN config invalid: dns.rules must be a list")
 
         outbounds = config.get("outbounds", [])
         if not isinstance(outbounds, list):
@@ -1009,16 +1112,28 @@ if ($null -ne $value -and $value.Length -gt 0) {{
             route["final"] = "proxy"
         else:
             keywords = self.extract_proxy_keywords()
-            updated_rules = []
-            for rule in rules:
-                if not isinstance(rule, dict):
-                    updated_rules.append(rule)
-                    continue
-                if "domain_keyword" in rule:
-                    rule["domain_keyword"] = keywords
-                updated_rules.append(rule)
-            route["rules"] = updated_rules
-            route["final"] = "direct"
+
+            def _inject_keywords(rule_list: List[Any]) -> List[Any]:
+                updated_rule_list = []
+                for rule in rule_list:
+                    if not isinstance(rule, dict):
+                        updated_rule_list.append(rule)
+                        continue
+                    if "domain_keyword" in rule:
+                        new_rule = dict(rule)
+                        new_rule["domain_keyword"] = keywords
+                        updated_rule_list.append(new_rule)
+                    else:
+                        updated_rule_list.append(rule)
+                return updated_rule_list
+
+            route["rules"] = _inject_keywords(rules)
+            dns["rules"] = _inject_keywords(dns_rules)
+
+            auto_final = str(
+                self.vpn_cfg.get("auto_mode_final_outbound", route.get("final", "proxy"))
+            ).strip().lower() or "proxy"
+            route["final"] = auto_final
 
         return config
 

@@ -2,6 +2,11 @@
   "log": {
     "level": "info"
   },
+  "experimental": {
+    "cache_file": {
+      "enabled": true
+    }
+  },
   "dns": {
     "servers": [
       {
@@ -16,6 +21,30 @@
         "type": "udp",
         "server": "223.5.5.5",
         "server_port": 53
+      }
+    ],
+    "rules": [
+      {
+        "rule_set": "geosite-geolocation-cn",
+        "server": "local"
+      },
+      {
+        "type": "logical",
+        "mode": "and",
+        "rules": [
+          {
+            "rule_set": "geosite-geolocation-!cn",
+            "invert": true
+          },
+          {
+            "rule_set": "geoip-cn"
+          }
+        ],
+        "server": "local"
+      },
+      {
+        "domain_keyword": [],
+        "server": "remote"
       }
     ],
     "final": "remote",
@@ -59,7 +88,33 @@
   ],
   "route": {
     "auto_detect_interface": true,
-    "default_domain_resolver": "remote",
+    "default_domain_resolver": "local",
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "geoip-cn",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
+        "download_detour": "proxy",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-geolocation-cn",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-cn.srs",
+        "download_detour": "proxy",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-geolocation-!cn",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.srs",
+        "download_detour": "proxy",
+        "update_interval": "1d"
+      }
+    ],
     "rules": [
       {
         "action": "sniff"
@@ -73,8 +128,20 @@
         "outbound": "direct"
       },
       {
-        "domain_suffix": [
-          "cn"
+        "rule_set": "geosite-geolocation-cn",
+        "outbound": "direct"
+      },
+      {
+        "type": "logical",
+        "mode": "and",
+        "rules": [
+          {
+            "rule_set": "geoip-cn"
+          },
+          {
+            "rule_set": "geosite-geolocation-!cn",
+            "invert": true
+          }
         ],
         "outbound": "direct"
       },
@@ -83,6 +150,6 @@
         "outbound": "proxy"
       }
     ],
-    "final": "direct"
+    "final": "proxy"
   }
 }

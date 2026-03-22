@@ -2,7 +2,14 @@
   "profile_name": "node-1-office",
   "app": {
     "icon_path": "resources/OpenClaw.jfif",
-    "log_path": "logs/node-1-office.log",
+    "log_root_dir": "logs",
+    "log_path": "node-1-office.log",
+    "node_stdout_log_path": "node.stdout.log",
+    "node_stderr_log_path": "node.stderr.log",
+    "ssh_stdout_log_path": "ssh.stdout.log",
+    "ssh_stderr_log_path": "ssh.stderr.log",
+    "vpn_stdout_log_path": "vpn.stdout.log",
+    "vpn_stderr_log_path": "vpn.stderr.log",
     "auto_start_node": true,
     "auto_start_vpn": true,
     "check_interval": 10,
@@ -27,14 +34,14 @@
     "direct_gateway_port": 18789,
     "direct_gateway_url": "ws://100.110.207.125:18789/",
     "tunnel_gateway_url": "ws://127.0.0.1:18789/",
-  "ssh_tunnel": {
-    "enabled": true,
-    "ssh_exe": "ssh",
-    "ssh_user": "root",
-    "ssh_host": "100.110.207.125",
-    "remote_forward_host": "100.110.207.125",
-    "remote_forward_port": 18789
-  },
+    "ssh_tunnel": {
+      "enabled": true,
+      "ssh_exe": "ssh",
+      "ssh_user": "root",
+      "ssh_host": "100.110.207.125",
+      "remote_forward_host": "100.110.207.125",
+      "remote_forward_port": 18789
+    },
     "node_port": 18790,
     "gateway_tunnel_local_port": 18789
   },
@@ -43,6 +50,7 @@
     "config_template_path": "resources/config-tun-rule.template.json",
     "cert_path": "resources/server.crt",
     "generated_config_path": "generated/node-1-office.config-tun-rule.generated.json",
-    "keyword_file_path": "resources/tun-rule-proxy-keywords.md"
+    "keyword_file_path": "tun-rule-proxy-keywords.md",
+    "auto_mode_final_outbound": "proxy"
   }
 }

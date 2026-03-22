@@ -44,17 +44,27 @@ python .\openclaw_node_tray_app.py --console
 其中：
 
 - `VPN ON`：全部流量走 VPN
-- `VPN AUTO`：只按关键词分流
+- `VPN AUTO`：中国/局域网流量优先直连，其余默认走 VPN；关键词可做强制代理覆盖
 - `VPN OFF`：关闭 VPN
 - `Reload`：只重载 VPN 配置与关键词，不重启整个托盘程序
 
 ## 关键词配置入口
 
-关键词现在只从 `resources/tun-rule-proxy-keywords.md` 读取。
+关键词现在只从 `node1/tun-rule-proxy-keywords.md` 读取。
 
 - `node-1-office.profile.json` 不再保存关键词列表
 - `resources/config-tun-rule.template.json` 也不再保存实际关键词内容
 - 修改关键词后，点击托盘菜单里的 `Reload` 即可生效
+- 旧的 `resources/tun-rule-proxy-keywords.md` 可以删除
+
+## AUTO 模式现在怎么分流
+
+- 局域网 / 私网：直连
+- 中国站点：直连
+- 关键词命中的站点：强制走 VPN
+- 其他流量：默认走 VPN
+
+这比“只按关键词分流”更接近日常使用场景，比如 Google 走 VPN、哔哩哔哩直连。
 
 ## 源码直启版做了什么
 
